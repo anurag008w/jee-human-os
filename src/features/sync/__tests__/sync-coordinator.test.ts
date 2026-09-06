@@ -22,6 +22,11 @@ class FakeSync extends SyncService {
   deletes: SyncScope[] = [];
   forcePushes = 0;
   failNext = false;
+  /** When 'auth', every push fails with a final 401 (like an invalid session). */
+  authMode: 'ok' | 'auth' = 'ok';
+  probeResult: 'ok' | 'auth' | 'network' | 'server' = 'ok';
+  probes = 0;
+  statusCalls = 0;
 
   constructor() {
     super({} as never);
@@ -29,6 +34,11 @@ class FakeSync extends SyncService {
 
   override async scopes(_s: AuthSession): Promise<SyncScope[]> {
     return this.scopesOnServer;
+  }
+
+  override async status(_s: AuthSession): Promise<{ exists: boolean; updatedAt: string; bytes: number }> {
+    this.statusCalls++;
+    return { exists: false, updatedAt: '', bytes: 0 };
   }
 
   override async pull(_s: AuthSession, scope: SyncScope) {
@@ -39,7 +49,13 @@ class FakeSync extends SyncService {
   override async push(_s: AuthSession, scope: SyncScope, state: unknown): Promise<SyncPushResult> {
     this.pushes.push({ scope, state });
     if (this.failNext) return { ok: false, updatedAt: '', status: 500, message: 'boom' };
+    if (this.authMode === 'auth') return { ok: false, updatedAt: '', status: 401, message: 'unauthorized', auth: true };
     return { ok: true, updatedAt: '2026-01-02T00:00:00.000Z' };
+  }
+
+  override async probe(_s: AuthSession): Promise<'ok' | 'auth' | 'network' | 'server'> {
+    this.probes++;
+    return this.probeResult;
   }
 
   override async forceServerPush(_s: AuthSession): Promise<boolean> {
@@ -52,7 +68,7 @@ class FakeSync extends SyncService {
   }
 }
 
-function makeCoordinator(fake: FakeSync, overrides: Partial<Parameters<SyncCoordinator['attach']>[0] & object> = {}) {
+function makeCoordinator(fake: FakeSync, overrides: Record<string, unknown> = {}) {
   return new SyncCoordinator(fake as SyncService, {
     getState: () => state,
     getChatSessions: () => chat,
@@ -163,5 +179,60 @@ describe('SyncCoordinator', () => {
     await coord.syncNow();
     expect(fake.pushes.map((p) => p.scope)).toEqual(['state', 'chat']);
     expect(fake.forcePushes).toBe(0);
+  });
+
+  it('P11: repeated final 401s surface an honest error, bounded silent retries, no 401 spam', async () => {
+    const fake = new FakeSync();
+    fake.authMode = 'auth';
+    fake.probeResult = 'auth'; // server rejects the apiKey fallback too (banned/removed)
+    const coord = makeCoordinator(fake, { applyServerCredential: () => undefined });
+    await coord.attach(SESSION, { skipInitialSync: true });
+
+    // 3 flush cycles, each 401 → silentReauth is cooldown-gated (60s) and after
+    // AUTH_MAX_SILENT_RETRIES=2 we give up with a clear re-login error.
+    coord.markDirty('state');
+    await new Promise((r) => setTimeout(r, 2200));
+    coord.markDirty('state');
+    await new Promise((r) => setTimeout(r, 2200));
+    coord.markDirty('state');
+    await new Promise((r) => setTimeout(r, 2200));
+
+    expect(coord.getScopeState('state').state).toBe('error');
+    expect(coord.getScopeState('state').lastError).toContain('re-login');
+    // Cooldown blocked immediate reprobes — no silent 401 hammering.
+    expect(fake.probes).toBe(0);
+  }, 15_000);
+
+  it('P11: reconcileIfStale stays quiet while auth is in trouble (no status hammering)', async () => {
+    const fake = new FakeSync();
+    fake.authMode = 'auth';
+    const coord = makeCoordinator(fake);
+    await coord.attach(SESSION, { skipInitialSync: true });
+
+    coord.markDirty('state');
+    await new Promise((r) => setTimeout(r, 2200)); // trigger the 401 path
+
+    const statusCallsBefore = fake.statusCalls;
+    await coord.reconcileIfStale(); // poll/focus/visibility moment
+    expect(fake.statusCalls).toBe(statusCallsBefore); // no status probe fired
+  });
+
+  it('P11: attach resets auth counters so a fresh login recovers immediately', async () => {
+    const fake = new FakeSync();
+    fake.authMode = 'auth';
+    const coord = makeCoordinator(fake);
+    await coord.attach(SESSION, { skipInitialSync: true });
+
+    coord.markDirty('state');
+    await new Promise((r) => setTimeout(r, 2200));
+    expect(coord.getScopeState('state').state).toBe('error');
+
+    // Session fixed; user re-login → attach → counters cleared → healthy again.
+    fake.authMode = 'ok';
+    await coord.attach(SESSION, { skipInitialSync: true });
+    coord.markDirty('state');
+    await new Promise((r) => setTimeout(r, 2200));
+    expect(coord.getScopeState('state').state).toBe('online');
+    expect(coord.getScopeState('state').lastError).toBeNull();
   });
 });

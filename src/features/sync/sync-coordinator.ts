@@ -51,6 +51,21 @@ export class SyncCoordinator {
   private online = !(typeof navigator !== 'undefined' && navigator.onLine === false);
   private listeners = new Set<() => void>();
   private scopeStates = new Map<SyncScope, SyncScopeState>();
+  /**
+   * P11 guarded silent re-auth (no 401 spam, no auto-login-with-password):
+   * - Only fires while a session is ATTACHED (logout → detach() nulls it and
+   *   all re-auth paths early-return).
+   * - Re-auth = same stored apiKey (the credential chat already uses via
+   *   configureServerAuth), NOT /auth/login — no password exists.
+   * - Cooldown 60s between failures; after 2 silent tries we STOP until a
+   *   user-initiated login/attach resets the counters.
+   */
+  private authTroubleSince: number | null = null;
+  private authFailures = 0;
+  private static readonly AUTH_MAX_SILENT_RETRIES = 2;
+  private static readonly AUTH_REPROBE_COOLDOWN_MS = 60_000;
+  /** Ready to apply the long-lived apiKey credential (wired from the container). */
+  private readonly applyServerCredential: (session: AuthSession) => void;
 
   constructor(
     sync: SyncService,
@@ -61,6 +76,8 @@ export class SyncCoordinator {
       replaceState: (state: unknown) => void;
       getMisaData?: () => MisaSyncPayload | null | Promise<MisaSyncPayload | null>;
       replaceMisaData?: (data: MisaSyncPayload) => void;
+      /** P11: applies the long-lived apiKey credential to the AI gateway (same credential chat uses). */
+      applyServerCredential?: (session: AuthSession) => void;
     },
     opts: { debounceMs?: number } = {},
   ) {
@@ -71,6 +88,7 @@ export class SyncCoordinator {
     this.replaceState = deps.replaceState;
     this.getMisaData = deps.getMisaData ?? (() => null);
     this.replaceMisaData = deps.replaceMisaData ?? (() => undefined);
+    this.applyServerCredential = deps.applyServerCredential ?? (() => undefined);
     this.debounceMs = opts.debounceMs ?? PUSH_DEBOUNCE_MS;
     if (typeof window !== 'undefined') {
       window.addEventListener('online', () => this.handleOnline());
@@ -113,6 +131,8 @@ export class SyncCoordinator {
   /** Attach after login. Reconciles with server data cleanly. */
   attach(session: AuthSession, opts: { skipInitialSync?: boolean } = {}): Promise<void> | void {
     this.session = session;
+    this.authFailures = 0;
+    this.authTroubleSince = null;
     this.dirty.clear();
     this.scopeStates.clear();
     this.startPollTimer();
@@ -139,6 +159,8 @@ export class SyncCoordinator {
     this.dirty.clear();
     this.inFlight = false;
     this.initialSyncDone = false;
+    this.authFailures = 0;
+    this.authTroubleSince = null;
     this.scopeStates.clear();
     this.emit();
   }
@@ -194,6 +216,19 @@ export class SyncCoordinator {
    */
   async reconcileIfStale(): Promise<void> {
     if (!this.session || !this.online || this.restoring || this.inFlight) return;
+    // P11: while auth is in trouble, do NOT hammer /sync/status per scope —
+    // just retry the guarded probe when the 60s cooldown elapses (these
+    // moments = tab-open / focus / visibility / poll — exactly when the user
+    // asked for a sync). When both credentials are rejected we stay quiet.
+    if (this.authTroubleSince !== null) {
+      if (
+        this.authFailures <= SyncCoordinator.AUTH_MAX_SILENT_RETRIES &&
+        Date.now() - this.authTroubleSince >= SyncCoordinator.AUTH_REPROBE_COOLDOWN_MS
+      ) {
+        await this.silentReauth();
+      }
+      return;
+    }
     const session = this.session;
     try {
       const stateStatus = await this.sync.status(session, 'state');
@@ -275,6 +310,7 @@ export class SyncCoordinator {
       this.setScopeState('state', { state: 'online', lastSyncedAt: now, lastError: null });
     } else {
       this.setScopeState('state', { state: 'error', lastError: res.message ?? 'Sync failed' });
+      if (res.auth) this.handleAuthFailure();
       this.dirty.add('state');
     }
   }
@@ -289,6 +325,7 @@ export class SyncCoordinator {
       this.setScopeState('chat', { state: 'online', lastSyncedAt: now, lastError: null });
     } else {
       this.setScopeState('chat', { state: 'error', lastError: res.message ?? 'Sync failed' });
+      if (res.auth) this.handleAuthFailure();
       this.dirty.add('chat');
     }
   }
@@ -304,6 +341,7 @@ export class SyncCoordinator {
       this.setScopeState('misa', { state: 'online', lastSyncedAt: now, lastError: null });
     } else {
       this.setScopeState('misa', { state: 'error', lastError: res.message ?? 'Sync failed' });
+      if (res.auth) this.handleAuthFailure();
       this.dirty.add('misa');
     }
   }
@@ -447,6 +485,7 @@ export class SyncCoordinator {
       this.setScopeState('state', { state: 'online', lastSyncedAt: now, lastError: null });
     } else {
       this.setScopeState('state', { state: 'error', lastError: stateRes.message ?? 'Sync failed' });
+      if (stateRes.auth) this.handleAuthFailure();
     }
     const sessions = this.getChatSessions();
     if (sessions.length > 0 && gen === this.generation) {
@@ -456,6 +495,7 @@ export class SyncCoordinator {
         this.setScopeState('chat', { state: 'online', lastSyncedAt: now, lastError: null });
       } else {
         this.setScopeState('chat', { state: 'error', lastError: chatRes.message ?? 'Sync failed' });
+        if (chatRes.auth) this.handleAuthFailure();
       }
     }
     const misaData = await this.getMisaData();
@@ -466,6 +506,7 @@ export class SyncCoordinator {
         this.setScopeState('misa', { state: 'online', lastSyncedAt: now, lastError: null });
       } else {
         this.setScopeState('misa', { state: 'error', lastError: misaRes.message ?? 'Sync failed' });
+        if (misaRes.auth) this.handleAuthFailure();
       }
     }
     this.emit();
@@ -494,5 +535,45 @@ export class SyncCoordinator {
       this.setScopeState(scope, { state: 'offline' });
     }
     this.emit();
+  }
+
+  /**
+   * P11: same stored apiKey applied + cheap probe. Never /auth/login (no
+   * password is stored — a future dev must NOT start persisting one here).
+   * Runs only on the 60s poll / tab-open / focus / visibility moments.
+   */
+  private async silentReauth(): Promise<void> {
+    const session = this.session;
+    if (!session) return; // logout → kabhi auto re-auth nahi
+    if (!session.apiKey) return; // fallback credential hi nahi
+    if (this.authTroubleSince && Date.now() - this.authTroubleSince < SyncCoordinator.AUTH_REPROBE_COOLDOWN_MS) return;
+
+    // Chat jaisa hi long-lived credential dobara apply (koi password nahi chahiye)
+    this.applyServerCredential(session);
+
+    const verdict = await this.sync.probe(session);
+    if (verdict === 'ok') {
+      this.authFailures = 0;
+      this.authTroubleSince = null;
+      this.setScopeState('state', { state: 'online', lastError: null });
+    } else if (verdict === 'auth') {
+      // Dono stored credentials reject → banned/removed server-side → CHUP
+      this.authFailures = SyncCoordinator.AUTH_MAX_SILENT_RETRIES + 1;
+      this.setScopeState('state', { state: 'error', lastError: 'Session invalid — Settings → Sync me re-login karo.' });
+    }
+    this.emit();
+  }
+
+  /** A push came back with a final 401/403 — bounded, cooldown-gated reaction. */
+  private handleAuthFailure(): void {
+    if (this.authTroubleSince === null) this.authTroubleSince = Date.now();
+    this.authFailures += 1;
+    if (this.authFailures <= SyncCoordinator.AUTH_MAX_SILENT_RETRIES) {
+      void this.silentReauth(); // same credentials, silent
+    } else {
+      // give up silently + surface honest state (no 401 spam)
+      this.setScopeState('state', { state: 'error', lastError: 'Session invalid — Settings → Sync me re-login karo.' });
+      this.emit();
+    }
   }
 }

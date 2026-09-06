@@ -22,6 +22,7 @@ import { validateProactiveDelivery } from './behavior-validator';
 import type { UserActivityState } from '../../core/domain/activity-signal';
 import { isAppActive } from '../../lib/notifications';
 import { container } from '../../di/container';
+import type { LiveCallOrigin } from '../../core/domain/live-types';
 
 export interface ProactivePreferences {
   enabled: boolean;
@@ -104,6 +105,8 @@ export interface IncomingCallEvent {
   reason: string;
   callerName: string;
   avatarUrl?: string;
+  /** Who initiated this call — 'auto' (proactive app) vs 'user_tool' (@ call). */
+  origin?: LiveCallOrigin;
 }
 
 export type IncomingCallListener = (event: IncomingCallEvent) => void;
@@ -253,6 +256,8 @@ class ProactiveAgentService {
   private prefs: ProactivePreferences = { ...DEFAULT_PROACTIVE_PREFS };
   private lastActiveTimestamp = Date.now();
   private lastUserChatTimestamp = 0;
+  /** Throttle: persist at most once per 20 s when typing floods this method. */
+  private lastTypingPersistAt = 0;
   private lastCallTimestamp = 0;
   private lastCallDeclinedTimestamp = 0;
   private consecutiveCallDeclines = 0;
@@ -686,9 +691,9 @@ class ProactiveAgentService {
     this.cancelScheduledForDoneEntity(type, value);
   }
 
-  /** AI tool ke liye: abhi turant call karo. */
+  /** AI tool ke liye: abhi turant call karo. (Student asked via @ tool → origin user_tool) */
   makeCall(reason: string): void {
-    this.triggerIncomingCall(reason || 'Misa call kar rahi hai');
+    this.triggerIncomingCall(reason || 'Misa call kar rahi hai', 'user_tool');
   }
 
   /** AI tool ke liye: cancel/delete a scheduled item by id. */
@@ -1079,6 +1084,23 @@ Instructions:
     this.saveState();
   }
 
+  /**
+   * Lightweight typing heartbeat — updates both activity timestamps so the
+   * 20-second proactive poll and 2-minute inactivity check never fire while
+   * the user is actively typing. SaveState is throttled (~20 s) to avoid
+   * writing to localStorage on every keystroke.
+   */
+  recordTyping(): void {
+    const now = Date.now();
+    this.lastActiveTimestamp = now;
+    this.lastUserChatTimestamp = now;
+    this.isUserCurrentlyInChat = true;
+    if (now - this.lastTypingPersistAt > 20_000) {
+      this.lastTypingPersistAt = now;
+      this.saveState();
+    }
+  }
+
   setDNDDuration(durationMs: number): void {
     this.dndUntilTimestamp = Date.now() + durationMs;
     this.cancelAllPendingTriggers();
@@ -1200,7 +1222,7 @@ Instructions:
       lowerUser.includes('mujhe call')
     ) {
       setTimeout(() => {
-        this.triggerIncomingCall('User ne chat me call karne ko kaha');
+        this.triggerIncomingCall('User ne chat me call karne ko kaha', 'user_tool');
       }, 1800);
       return;
     }
@@ -1576,7 +1598,7 @@ Instructions:
     }
   }
 
-  triggerIncomingCall(reason = 'Study check-in'): void {
+  triggerIncomingCall(reason = 'Study check-in', origin: LiveCallOrigin = 'auto'): void {
     if (!this.prefs.callsEnabled) return;
     if (this.isQuietTime()) return;
 
@@ -1598,6 +1620,7 @@ Instructions:
       callId: `call_${now}`,
       reason,
       callerName: 'Misa',
+      origin,
     };
 
     for (const listener of this.incomingCallListeners) {

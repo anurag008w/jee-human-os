@@ -1,5 +1,8 @@
 // Domain contracts and types for Gemini Live Multimodal Streaming.
 
+/** Who initiated a live call — drives greeting + call-origin system block (3-way). */
+export type LiveCallOrigin = 'user_tap' | 'user_tool' | 'auto';
+
 export type GeminiLiveVoice =
   | 'Aoede'
   | 'Kore'

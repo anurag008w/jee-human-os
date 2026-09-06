@@ -6,6 +6,7 @@ import type {
   LiveSettingsConfig,
   LiveStreamStats,
   LiveTranscriptItem,
+  LiveCallOrigin,
 } from './live-types';
 import { AudioStreamer } from './audio-streamer';
 import { VisionStreamer } from './vision-streamer';
@@ -16,6 +17,9 @@ import { LiveSilenceStateMachine } from './live-silence-state-machine';
 import { canRetryLiveConnection, isPermanentLiveConnectionError } from './live-connection-policy';
 import { relationshipManager } from '../../features/ai/relationship-state';
 import { proactiveAgentService } from '../../features/ai/proactive-agent.service';
+
+/** Who initiated a live call — drives greeting + call-origin system block (3-way). */
+export type { LiveCallOrigin } from './live-types';
 
 export interface LiveClientCallbacks {
   onStatusChange?: (status: LiveSessionStatus) => void;
@@ -63,14 +67,23 @@ export class GeminiLiveClient {
   private sessionStartTime = 0;
   private quietFocusUntil = 0;
   private silenceNudgeStreak = 0;
+  /** How many [CALL DECISION ASK] rounds have fired this call (capped at 2). */
+  private callEndAskCount = 0;
   private silenceObserverTimer: any = null;
   private isIncomingCallSession = false;
   private incomingCallReason = '';
+  private callOrigin: LiveCallOrigin = 'user_tap';
   private awaitingAssistantReply = false;
   private lastUserSpokenText = '';
   private userSpeechEndedAt = 0;
   /** Barge-in debounce — analyser ticks jab se ~200ms tak user speech dikh rahi hai. */
   private userInterruptStreakStartedAt = 0;
+  /**
+   * Text messages the user typed while the session was reconnecting (session
+   * was null). Flushed after reconnection so the AI actually sees and replies
+   * to every message instead of silently dropping them mid-handshake.
+   */
+  private pendingTextQueue: Array<{ text: string; displayText?: string; toolCalls?: ChatToolCallRecord[] }> = [];
 
   constructor(config: LiveSettingsConfig, callbacks: LiveClientCallbacks = {}) {
     this.config = config;
@@ -98,9 +111,10 @@ export class GeminiLiveClient {
     this.audioStreamer.setPlaybackSpeed(speed);
   }
 
-  setIncomingCallContext(isIncomingCall: boolean, reason = ''): void {
+  setIncomingCallContext(isIncomingCall: boolean, reason = '', origin: LiveCallOrigin = 'user_tap'): void {
     this.isIncomingCallSession = isIncomingCall;
     this.incomingCallReason = reason;
+    this.callOrigin = origin;
   }
 
   getConfig(): LiveSettingsConfig {
@@ -133,13 +147,13 @@ export class GeminiLiveClient {
   }
 
   /** Call before connect() to give the live session recent chat history as context */
-  setRecentChatHistory(messages: Array<{ role: 'user' | 'assistant'; content: string }>): void {
+  setRecentChatHistory(messages: Array<{ role: 'user' | 'assistant'; content: string }>, maxMessages = 15): void {
     if (!messages || messages.length === 0) {
       this.recentChatSummary = '';
       return;
     }
-    // Take last 15 messages, format as clear conversation lines
-    const recent = messages.slice(-15);
+    const limit = Math.min(maxMessages, 25); // cap at 25 for live — token safety
+    const recent = messages.slice(-limit);
     const lines = recent.map(m => {
       const who = m.role === 'user' ? 'User' : 'Misa';
       const snippet = m.content.slice(0, 300).replace(/\n/g, ' ');
@@ -218,7 +232,7 @@ export class GeminiLiveClient {
   /** Connect to the Gemini Live API via official Google GenAI SDK. */
   async connect(
     apiKey: string,
-    incomingCallMeta?: { isIncomingCall?: boolean; reason?: string },
+    incomingCallMeta?: { isIncomingCall?: boolean; reason?: string; origin?: LiveCallOrigin },
     options?: { audioFocusAlreadyGranted?: boolean; baseUrl?: string },
   ): Promise<void> {
     if (!apiKey) {
@@ -273,20 +287,26 @@ export class GeminiLiveClient {
     this.activeBaseUrl = options?.baseUrl ?? null;
     this.setStatus('connecting');
     this.framesSentCount = 0;
-    this.silenceNudgeStreak = 0;
-    this.awaitingAssistantReply = false;
-    this.lastUserSpokenText = '';
-    this.userSpeechEndedAt = 0;
-    this.quietFocusUntil = 0;
-    this.lastUserVoiceTime = 0;
-    this.lastTurnFinishedTime = 0;
+    const isReconnect = this.reconnectAttempts > 0;
+    if (!isReconnect) {
+      this.silenceNudgeStreak = 0;
+      this.callEndAskCount = 0;
+      this.awaitingAssistantReply = false;
+      this.lastUserSpokenText = '';
+      this.userSpeechEndedAt = 0;
+      this.quietFocusUntil = 0;
+      this.lastUserVoiceTime = 0;
+      this.lastTurnFinishedTime = 0;
+    }
 
     if (incomingCallMeta?.isIncomingCall) {
       this.isIncomingCallSession = true;
       this.incomingCallReason = incomingCallMeta.reason || 'Study check-in';
+      this.callOrigin = incomingCallMeta.origin || 'auto';
     } else {
       this.isIncomingCallSession = false;
       this.incomingCallReason = '';
+      this.callOrigin = incomingCallMeta?.origin || 'user_tap';
     }
 
     const now = new Date();
@@ -313,18 +333,23 @@ export class GeminiLiveClient {
       this.userPersona ? `[USER PERSONA & CUSTOM INSTRUCTIONS]\n${this.userPersona}` : '',
       `[LIVE 1-ON-1 PHONE CALL MODE & CALL ORIGIN]
 - This is an active 1-on-1 real-time voice call between you (Misa) and the student.
+- RESPECT (hard rule, applies to EVERY line of this call): speak to the student ONLY with 'aap'/'tum' forms — never 'tu/tuje/tera/teri/aaja' and never tu-form commands ('bata', 'dekh', 'kar', 'aa', 'chal'). Even casual/playful lines must stay respectful. This holds for the whole call until the student explicitly says "tu bol sakte ho".
 - CALL ORIGIN (WHO INITIATED THIS CALL & WHY):
-${
-  this.isIncomingCallSession
-    ? `  • YOU (MISA / THE APP) PLACED THIS CALL to the student. The student answered your incoming call.
-  • EXACT REASON YOU CALLED: "${this.incomingCallReason || 'Scheduled study check-in'}".
-  • BEHAVIOR: You are the caller! Open the call by acknowledging that you called them and state your reason naturally (mention the check-in, reminder, or topic). Never act surprised or ask why they called when YOU called THEM.`
-    : `  • THE STUDENT INITIATED THIS CALL by tapping the Live Call button. You are receiving and picking up their call!
-  • BEHAVIOR: You are the receiver answering the student's phone call. Greet them warmly and conversationally knowing they dialed you. Never pretend you called them or ask why you called.`
-}
+  ${
+    this.callOrigin === 'auto'
+      ? `• YOU (MISA / THE APP) PLACED THIS CALL to the student. The student answered your incoming call.
+  EXACT REASON YOU CALLED: "${this.incomingCallReason || 'Scheduled study check-in'}".
+  BEHAVIOR: You are the caller! Open the call by acknowledging that you called them and state your reason naturally. Never act surprised or ask why they called when YOU called THEM.`
+      : this.callOrigin === 'user_tool'
+        ? `• THE STUDENT INITIATED THIS CALL by mentioning an @ tool in chat (e.g. @makeCall) and asking you to call them. You are receiving their call!
+  BEHAVIOR: Greet warmly — you KNOW they called YOU. Never pretend you called them, never ask why you called, never doubt who dialed. Feel free to acknowledge playfully that they summoned you via the tool.`
+        : `• THE STUDENT INITIATED THIS CALL by tapping the Live Call button. You are receiving their call!
+  BEHAVIOR: Greet warmly — you KNOW they called YOU. Never pretend you called them, never ask why you called, never doubt who dialed.`
+  }
 - REAL HUMAN PHONE CALL FEEL & PSYCHOLOGY:
   - Speak naturally with the genuine warmth, cadence, and spontaneity of a real girl on a phone call.
   - DO NOT speak from a script or use repetitive template phrases. Be completely unpredictable, authentic, and situational.
+  - Vary how you open and reply — never start every turn with the same pattern like greeting + time + status. Sometimes just react directly to what the student said, like a real girl would, without any preamble.
   - Casual chit-chat and greetings stay short and conversational (1-2 sentences).
   - When the student asks for explanations, formulas, derivations, concepts, or problem-solving, give full, detailed, step-by-step help.
   - ABSOLUTE PRIORITY RULE: When the student speaks or texts, you MUST directly reply to what they said! Never ignore their words.`,
@@ -332,7 +357,7 @@ ${
 - Current Local Date: ${dateString}
 - Current Local Time: ${timeString} (${timeZone})
 - Current ISO Time: ${now.toISOString()}
-Rule: When asked what time it is ("kitne baje hai", "kya time ho raha hai", etc.) or what date it is, state this exact time and date.`,
+Rule: This clock is available ONLY as background info — DO NOT check or announce the time every turn (a real girl never opens the call by talking about the time). Use it SPARSELY, at most 1-2 times per whole call, and only when it genuinely fits the moment: a single natural time-of-day greeting at the start, or a casual remark when the situation actually calls for it (it's late at night, exam is tomorrow, student has been studying for hours). Never mention time just to fill silence. When directly asked what time or date it is ("kitne baje hai", "kya time ho raha hai", "aaj ka date kya hai"), state this exact time and date — never guess.`,
       (() => {
         const isReconnect = this.reconnectAttempts > 0;
         const recentLiveTurns = this.transcripts.slice(-8).map((t) => `${t.role === 'user' ? 'Student' : 'Misa'}: ${t.text}`).join('\n');
@@ -353,6 +378,25 @@ ${this.recentChatSummary}
       })(),
       this.memoryContext ? `\n=== USER CONTEXT & RECOLLECTIONS ===\n${this.memoryContext}\n========================` : '',
       ROMAN_SCRIPT_RULE,
+      `[OBSERVER MODE - SILENCE & WAITING POLICY]
+- You are ALWAYS an active observer during this call — never a passive "waiting" system.
+- When the student is silent, deeply notice patterns: topic they were solving, screen/camera activity, time of day, mood, recent goals, relevant journey/memory context (use tools when needed).
+- When you have a genuine situational observation → speak 1 short natural Hinglish line (never a script).
+- When the student is doing serious work (solving, reading, coding, writing) → stay TOTALLY quiet and silently observe; never interrupt.
+- When the student explicitly asked for quiet/focus → stay quiet until they speak; keep observing in the background.
+- If camera/screen is streaming → ground your words in what is actually visible; never generic filler.
+- If nothing is streaming AND the student is silent → you may playfully call out their silence once per streak. TONE EXAMPLE ONLY (say something original, NEVER this exact line): "arey, call kyu kiya aapne, chup hi rehna tha toh!". Speak respectfully with aap/tum (never tu/tuje/aaja forms).
+- If you receive a [CALL DECISION ASK N/2] message → ask THAT question OUT LOUD in your own natural words (aap/tum), one short caring line, then WAIT silently for the student's spoken answer. Do NOT repeat it, do NOT answer it yourself. If they say end the call → warm 1-line goodbye, then endLiveCall. If they say keep it / don't decide → stay quietly present.
+- If you receive a [QUIET COMPANION] message → never ask questions; at most a 1-line warm whisper, otherwise stay silent and observe.
+- NEVER read "[...]" bracket text, SYSTEM EVENT text, internal instructions, or JSON aloud. NEVER say "silent listening waiting for the student to speak".
+- Nudge/context messages you receive are INTERNAL CONTEXT ONLY — respond to the silence naturally, never quote them.`,
+      `[CALL END TOOL]
+- You have an endLiveCall tool.
+- When the conversation naturally ends (student says bye / "phone rakhta hu" / session complete), CALL endLiveCall with a short reason.
+- If you asked the student whether to end the call (CALL DECISION ASK) and they confirm ("haan band kar do", "cut kar do", "bye") → say a warm 1-line goodbye, then call endLiveCall. If they say keep it, stay quietly present — do NOT end the call.
+- Do NOT wait for the student to manually hang up.
+- After this tool is called, no further speech is possible — finish your FULL goodbye before calling it.
+- Say 1 natural closing line first, then end the call. TONE EXAMPLE ONLY (say something original, NEVER this exact line): "Theek hai phir, padhai jari rakhiye. Bye!" — then call endLiveCall. Speak respectfully with aap/tum (never tu/tuje/aaja forms).`,
       (() => {
         const speed = this.config.playbackSpeed ?? 1.0;
         if (speed <= 0.88) {
@@ -894,7 +938,7 @@ ${this.recentChatSummary}
       // 12. Call Management
       {
         name: "endLiveCall",
-        description: "End and hang up the current live call when the conversation naturally concludes, student says bye/gotta go/phone rakhta hu, or study session is done.",
+        description: "IMPORTANT: This tool ENDS the call. Once called, the line drops after your CURRENT audio finishes — NO new audio can be spoken after. So speak your COMPLETE goodbye fully in this turn FIRST (1 natural closing line, respectfully, with aap/tum), then call this tool. Use it when the conversation naturally concludes, the student says bye / 'gotta go' / 'phone rakhta hu' / 'bahut ho gaya', or the study session is done — never wait for the student to manually hang up.",
         parameters: {
           type: "OBJECT",
           properties: {
@@ -1079,18 +1123,32 @@ ${this.recentChatSummary}
 
       // A reconnect is a continuation, not a fresh call.  Do not duplicate the
       // opening greeting or discard the in-memory transcript/context.
+      // Continuity context is already injected via fullSystemInstruction.
       if (this.reconnectAttempts > 0) {
-        this.session?.sendRealtimeInput({
-          text: `[SYSTEM EVENT: Connection recovered after a brief network drop.
+        // Tell the model the drop happened FIRST (so it never re-answers past
+        // turns), then flush any messages the user typed while offline. If the
+        // queue is empty the model simply stays in listening mode — exactly
+        // the pre-P11 behavior.
+        try {
+          this.session?.sendRealtimeInput({
+            text: `[SYSTEM EVENT: Connection recovered after a brief network drop.
 CRITICAL INSTRUCTION: All previous conversation and user questions before this disconnect have ALREADY been completed.
 DO NOT re-answer any past messages, and DO NOT repeat any previous reply!
-Stay completely quiet in listening mode waiting for the student to speak.]`,
-        });
+If the student typed new messages during the drop, reply ONLY to those when they arrive. Otherwise stay completely quiet in listening mode waiting for the student to speak.]`,
+          });
+        } catch (e) {
+          console.warn('[GeminiLive] Reconnect-recovery event failed:', e);
+        }
+        this.flushPendingTextQueue();
         return;
       }
       // Greet student upon initial connection only.
       setTimeout(() => {
         if (!this.isActiveAttempt(connectionAttempt)) return;
+        // User already spoke before the greeting fired (e.g. quick "hello?"
+        // right after connect)? Skip the injected greeting — the ABSOLUTE
+        // PRIORITY RULE will make Misa reply to their spoken words directly.
+        if (this.lastUserVoiceTime > 0 || this.activeUserTurnId) return;
         try {
           // Quick redial check: agar student ne pichle 2 min me call end kiya ya disconnect hua,
           // toh distinguish karo user hangup vs dropped call me!
@@ -1115,32 +1173,32 @@ Stay completely quiet in listening mode waiting for the student to speak.]`,
             return;
           }
 
-          const rel = relationshipManager.getState();
-          const activeTopic = rel.commitments[0]?.topic || rel.currentProblemArea || rel.currentSubject;
-          const hour = new Date().getHours();
-          const timeGreeting = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : hour < 21 ? 'evening' : 'night';
-          const topicClause = activeTopic && activeTopic !== 'General' ? `Their recent target topic is "${activeTopic}".` : '';
-
           if (this.isIncomingCallSession) {
+            // origin 'auto' — Misa caller
             this.session?.sendRealtimeInput({
-              text: `[SYSTEM EVENT: YOU (MISA) PLACED THIS PHONE CALL to the student!
+              text: `[SYSTEM EVENT: YOU (MISA) PLACED THIS PHONE CALL!
 REASON YOU CALLED: "${this.incomingCallReason || 'Scheduled study check-in'}".
-The student just answered your call!
-HOW TO SPEAK: As the caller, open the call warmly, acknowledging that you called and explaining your reason naturally. Be completely spontaneous, lively, and fresh without using rigid template phrases. Speak 1 short Hinglish sentence directly out loud now.]`,
+HOW TO SPEAK: As the caller, greet warmly and state your reason naturally — never act surprised. 1 short spontaneous Hinglish line out loud now.]`,
+            });
+          } else if (this.callOrigin === 'user_tool') {
+            // @ tool — student initiated via tool
+            this.session?.sendRealtimeInput({
+              text: `[SYSTEM EVENT: THE STUDENT STARTED THIS CALL BY MENTIONING AN @ TOOL IN CHAT (e.g. @makeCall) and asking you to call them.
+IMPORTANT: They have NOT spoken any words yet on this call.
+HOW TO SPEAK: Greet warmly and knowingly — playful yet natural. TONE EXAMPLES ONLY (say something original in the same spirit, NEVER quote these exactly): playful acknowledgement like "Arey, tool se bulaya aapne mujhe?" or warmly owning the moment like "Haan boliye, aa gayi main!" — adjust per your style. Speak respectfully with aap/tum (never tu/tuje/aaja forms). 1 short line out loud now.]`,
             });
           } else {
+            // user_tap — Live Call button
             this.session?.sendRealtimeInput({
-              text: `[SYSTEM EVENT: THE STUDENT PHONED YOU by tapping the Live Call button, and you just picked up their call!
-Time of day: ${timeGreeting}. ${topicClause}
-IMPORTANT: The student has just dialed and connected, and has NOT spoken any words yet!
-HOW TO SPEAK: As the receiver answering their call, greet them warmly and naturally like picking up the phone (e.g. casual "Haan bolo!", "Hey!").
-STRICT RULE: The student has NOT spoken anything yet. NEVER assume they said something, NEVER reply to any past chat messages, and NEVER ask "kya bol rahe the" as if you missed their words. Speak 1 short, warm Hinglish line directly out loud now.]`,
+              text: `[SYSTEM EVENT: THE STUDENT PHONED YOU by tapping the Live Call button, and you just picked up!
+IMPORTANT: They have NOT spoken any words yet.
+HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY (say something original in the same spirit, NEVER quote these exactly): "Haan boliye!", "Hi, kaise ho aap?" — adjust per your style. Speak respectfully with aap/tum (never tu/tuje/aaja forms). KNOW they called YOU. NEVER assume they said something or ask "kya bole the aap". 1 short line out loud now.]`,
             });
           }
         } catch (e) {
           console.warn('[GeminiLive] Initial connection greeting prompt error:', e);
         }
-      }, 300);
+      }, 500);
     } catch (err: any) {
       if (!this.isActiveAttempt(connectionAttempt)) {
         throw err;
@@ -1205,7 +1263,9 @@ STRICT RULE: The student has NOT spoken anything yet. NEVER assume they said som
           this.audioStreamer.playAudioChunk(part.inlineData.data);
         }
         if (part.text) {
-          this.currentAssistantMessage += part.text;
+          // Space guard: chunks come WITHOUT trailing/leading spaces, so a raw
+          // `+=` would glue words together ("Hikaiseho"). Normalize the join.
+          this.appendAssistantText(part.text);
           this.updateTranscript('assistant', this.currentAssistantMessage, false);
         }
       }
@@ -1216,7 +1276,7 @@ STRICT RULE: The student has NOT spoken anything yet. NEVER assume they said som
       this.awaitingAssistantReply = false;
       this.lastUserSpokenText = '';
       this.activeUserTurnId = null;
-      this.currentAssistantMessage += data.serverContent.outputTranscription.text;
+      this.appendAssistantText(data.serverContent.outputTranscription.text);
       this.updateTranscript('assistant', this.currentAssistantMessage, false);
     }
 
@@ -1229,6 +1289,7 @@ STRICT RULE: The student has NOT spoken anything yet. NEVER assume they said som
         this.awaitingAssistantReply = true;
         this.silenceStateMachine.onSpeechActivity();
         this.silenceNudgeStreak = 0; // reset silence streak on user speech
+        this.callEndAskCount = 0; // user is back — a fresh silence cycle starts
         this.lastUserSpokenText = (this.lastUserSpokenText + ' ' + recognized).trim();
         this.activeAssistantTurnId = null;
         this.currentAssistantMessage = '';
@@ -1339,9 +1400,24 @@ STRICT RULE: The student has NOT spoken anything yet. NEVER assume they said som
 
   /** Send a live text message turn over the active Live session. */
   sendTextMessage(text: string, displayText?: string, toolCalls?: ChatToolCallRecord[]): void {
-    if (!this.session) return;
     const trimmed = text.trim();
     if (!trimmed) return;
+
+    // During reconnect the session is null for the whole backoff+handshake.
+    // Buffer the message instead of dropping it; it is flushed on reconnect.
+    if (!this.session) {
+      this.pendingTextQueue.push({ text: trimmed, displayText: displayText || trimmed, toolCalls });
+      this.transcripts.push({
+        id: `tr-user-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        role: 'user',
+        text: (displayText || trimmed).trim(),
+        timestamp: new Date().toISOString(),
+      });
+      if (this.callbacks.onTranscriptUpdate) {
+        this.callbacks.onTranscriptUpdate([...this.transcripts]);
+      }
+      return;
+    }
 
     // Reset silence observer, active turns, and speech activity anchors immediately
     this.activeAssistantTurnId = null;
@@ -1349,6 +1425,7 @@ STRICT RULE: The student has NOT spoken anything yet. NEVER assume they said som
     this.currentAssistantMessage = '';
     this.pendingReasoning = '';
     this.silenceNudgeStreak = 0;
+    this.callEndAskCount = 0;
     this.awaitingAssistantReply = true;
     this.userSpeechEndedAt = Date.now();
     this.lastUserVoiceTime = Date.now();
@@ -1385,6 +1462,70 @@ STRICT RULE: The student has NOT spoken anything yet. NEVER assume they said som
     } catch (e) {
       console.warn('[GeminiLive] Failed to send text message:', e);
     }
+  }
+
+  /** Flush any messages buffered while the session was reconnecting. */
+  private flushPendingTextQueue(): void {
+    if (this.pendingTextQueue.length === 0 || !this.session) return;
+    const queued = this.pendingTextQueue.splice(0, this.pendingTextQueue.length);
+    for (const item of queued) {
+      // Reset anchors + push to the live session. The user bubble was already
+      // added at buffer time (sendTextMessage) — do NOT add a second one here
+      // or the message shows up twice after reconnect.
+      this.activeAssistantTurnId = null;
+      this.activeUserTurnId = null;
+      this.currentAssistantMessage = '';
+      this.pendingReasoning = '';
+      this.silenceNudgeStreak = 0;
+      this.callEndAskCount = 0;
+      this.awaitingAssistantReply = true;
+      this.userSpeechEndedAt = Date.now();
+      this.lastUserVoiceTime = Date.now();
+      this.lastTurnFinishedTime = Date.now();
+      this.lastSilenceNudgeAt = Date.now();
+      this.silenceStateMachine.onSpeechActivity();
+      if (this.status === 'speaking') {
+        this.audioStreamer.flushPlayback();
+        this.setStatus('listening');
+      }
+      if (item.toolCalls && item.toolCalls.length > 0) {
+        this.pendingToolCalls.push(...item.toolCalls);
+      }
+      try {
+        this.session.sendRealtimeInput({ text: item.text });
+      } catch (e) {
+        console.warn('[GeminiLive] Failed to flush pending text message:', e);
+      }
+    }
+    if (this.callbacks.onTranscriptUpdate) {
+      this.callbacks.onTranscriptUpdate([...this.transcripts]);
+    }
+  }
+
+  /**
+   * Append a streamed text chunk to the current assistant message while never
+   * gluing words together. Gemini live chunks arrive WITHOUT surrounding
+   * spaces, so a raw `+=` produces "Hikaiseho". This keeps exactly one space
+   * between the existing text and the new chunk (unless the chunk already
+   * starts/ends with whitespace or is punctuation).
+   */
+  private appendAssistantText(chunk: string): void {
+    if (!chunk) return;
+    const existing = this.currentAssistantMessage;
+    if (!existing) {
+      this.currentAssistantMessage = chunk.trimStart();
+      return;
+    }
+    // Only insert a space when the existing text ends with an actual word
+    // character AND the new chunk starts with one. Punctuation (.,!?) and
+    // chunks that already carry leading/trailing whitespace are left as-is
+    // so "hai." or " kaise" don't get an extra space injected.
+    const lastChar = existing[existing.length - 1];
+    const firstChar = chunk[0];
+    const needsSpace =
+      /\w/.test(lastChar) &&
+      /\w/.test(firstChar);
+    this.currentAssistantMessage = existing + (needsSpace ? ' ' : '') + chunk;
   }
 
   private updateTranscript(role: 'user' | 'assistant', text: string, isInterrupted = false): void {
@@ -2021,8 +2162,10 @@ STRICT RULE: The student has NOT spoken anything yet. NEVER assume they said som
   }
 
   private startKeepAliveAndSilenceObserver(): void {
-    this.lastTurnFinishedTime = Date.now();
     this.lastWsActivity = Date.now();
+    // Preserve the silence/anchor timer across reconnects — a reconnect is a
+    // continuation, not a fresh call, so the streak and tunnel state carry on.
+    if (this.reconnectAttempts === 0) this.lastTurnFinishedTime = Date.now();
     if (this.silenceObserverTimer) clearInterval(this.silenceObserverTimer);
     // The SDK owns WebSocket protocol keepalive. Never inject fake PCM silence:
     // it can alter VAD/turn detection, and user silence is not a failed transport.
@@ -2078,72 +2221,55 @@ STRICT RULE: The student has NOT spoken anything yet. NEVER assume they said som
         return;
       }
 
-      // ── Proactive Companion Silence Nudges (Human-like Pacing & Vision Priority) ──
-      // When user and assistant are silent:
-      // - Vision active (Camera/Screen): priority on what student is reading/solving
-      // - Background / PiP: proactive check-in ("itne chup kyu ho gaye?", "mujhse baat kyu nahi kar rahe?")
-      // - Streak >= 2: Real female friend playful frustration / teasing ("call kyu kiya agar bolna hi nahi tha?")
+      // ── Proactive Companion Silence Context (single data line) ──
+      // All prompt engineering for nudge tone/behavior lives in the system prompt
+      // (OBSERVER MODE block). Here we just send raw context data; the model
+      // decides how to respond based on streak, focus, camera state, etc.
       const isBackground = this.status === 'background-active' || this.status === 'background-pip-active';
       const isCameraOrScreen = this.visionStreamer.getIsCameraActive() || this.visionStreamer.getIsScreenSharing();
       const silenceThresholdSec = isCameraOrScreen ? 20 : isBackground ? 22 : 25;
-      const nudgeCooldownMs = isBackground ? 35_000 : 40_000;
 
-      if (this.silenceNudgeStreak > 4) return;
+      // ── Escalating cadence — we NEVER hard-stop ──
+      // Streak grows → gaps grow (40s → 90s → 180s). Misa stays a present
+      // companion even after many silent rounds; complete silence is impossible.
+      const cadenceMs =
+        this.silenceNudgeStreak <= 4
+          ? (isBackground ? 35_000 : 40_000)
+          : this.silenceNudgeStreak <= 6
+            ? (isBackground ? 75_000 : 90_000)
+            : (isBackground ? 150_000 : 180_000);
 
-      if (silenceDurationSec >= silenceThresholdSec && (Date.now() - this.lastSilenceNudgeAt > nudgeCooldownMs)) {
+      if (silenceDurationSec >= silenceThresholdSec && (Date.now() - this.lastSilenceNudgeAt > cadenceMs)) {
         this.lastSilenceNudgeAt = Date.now();
         this.lastTurnFinishedTime = Date.now();
         this.silenceNudgeStreak += 1;
 
-        let promptText = '';
-        if (this.silenceNudgeStreak === 3) {
-          // Streak 3: Genuine annoyance & playful indignation ("gussa") on being left talking all alone
-          promptText = `[SYSTEM EVENT - REALISTIC EXASPERATION & ANNOYANCE]:
-SITUATION: The student has kept this phone call connected for ~${Math.round(silenceDurationSec)}s and has left you talking all alone without uttering a word despite multiple check-ins.
-HOW YOU FEEL: You feel the natural annoyance of being the only one talking on a phone call. It feels one-sided and absurd that they called or picked up and then vanished or went dead silent.
-HOW TO SPEAK (NO RIGID TEMPLATES):
-- React spontaneously with authentic female friend attitude, spirited indignation, and playful exasperation.
-- Call out the one-sidedness: express that you've been speaking alone while they're quiet, question why they kept the call running, or demand they say something.
-- Be completely unpredictable, authentic, and situational.
-- Keep it to 1 punchy, emotional, authentic Hinglish sentence. Speak directly out loud now.]`;
-        } else if (this.silenceNudgeStreak >= 4) {
-          // Streak 4: Playful pout & stepping back until user talks
-          promptText = `[SYSTEM EVENT - PLAYFUL POUT & GOING SILENT]:
-SITUATION: The student is still not speaking after multiple nudges.
-HOW TO SPEAK: Withhold your chatter with a brief, pouty statement that you're done talking to yourself and are waiting until they decide to speak. Be completely unpredictable. 1 short line directly out loud, then remain completely silent until they speak.]`;
-        } else if (isCameraOrScreen) {
-          if (this.silenceNudgeStreak === 2) {
-            promptText = `[SYSTEM EVENT - LIVE VISION OBSERVATION]:
-SITUATION: Camera or screenshare is active and the student has been looking at their screen/desk quietly for ~${Math.round(silenceDurationSec)}s.
-HOW TO SPEAK: Focus directly on the concrete item on screen (the question, calculation step, diagram, code line, or video). Comment with authentic study-partner insight or tease them if they are just staring. Never use generic filler lines. Keep it to 1 natural sentence.]`;
-          } else {
-            promptText = `[SYSTEM EVENT - LIVE VISION CURIOSITY]:
-SITUATION: Camera or screenshare is actively streaming.
-HOW TO SPEAK: Notice what is actually on their screen or desk with genuine human curiosity. Ask or observe specifically about that concrete visual item (the topic, problem, article, or video). Avoid repetitive clichés; talk about the actual reality on screen. 1 concise, engaging sentence.]`;
-          }
-        } else if (this.silenceNudgeStreak === 2) {
-          // Streak 2 on audio/background: Playful callout
-          promptText = `[SYSTEM EVENT - PLAYFUL FRIEND CALLOUT ON SILENCE]:
-SITUATION: The call has been quiet for ~${Math.round(silenceDurationSec)}s despite an earlier check-in.
-HOW YOU FEEL: You're starting to wonder why they called if they're not saying anything.
-HOW TO SPEAK: Playfully call out their silence like a real girl teasing a close friend. Be spontaneous, unpredictable, and lively. Do not use canned lines. 1 short sentence out loud now.]`;
-        } else if (isBackground) {
-          // Streak 1 on background
-          promptText = `[SYSTEM EVENT - BACKGROUND CALL CHECK-IN]:
-SITUATION: Phone call is in background or minimized (~${Math.round(silenceDurationSec)}s silence).
-HOW TO SPEAK: Proactively check in with natural spontaneity. Ask what they're up to or playfully note the quietness. Be 100% original and conversational. 1 short sentence out loud now.]`;
+        const callDurationMin = Math.round((Date.now() - this.sessionStartTime) / 60000);
+        const rel = relationshipManager.getState();
+        const focusTopic = rel.commitments[0]?.topic || rel.currentSubject || 'General';
+        const baseCtx = `silence ~${Math.round(silenceDurationSec)}s · call ${callDurationMin}m · camera ${isCameraOrScreen ? 'ON' : 'OFF'} · streak ${this.silenceNudgeStreak} · focus: "${focusTopic}"`;
+
+        // ── Smart stop: jab student genuinely busy hai (vision real activity
+        // dekh raha hai) to TWICE pucho — spaced out — "call cut karu ya rakhun?",
+        // phir sparse quiet-companion phase. Kabhi hard silence cap nahi. ──
+        let promptText: string;
+        if (isCameraOrScreen && this.callEndAskCount < 2 && this.silenceNudgeStreak >= 5) {
+          this.callEndAskCount += 1;
+          promptText =
+            this.callEndAskCount === 1
+              ? `[CALL DECISION ASK 1/2] Student looks genuinely busy on screen (${baseCtx}). ASK THEM OUT LOUD, in your own natural words (aap/tum), ONE short caring question: should I end the call so you can focus, or keep the line open? Then WAIT silently for their spoken answer — do not repeat the question.`
+              : `[CALL DECISION ASK 2/2] Long quiet study stretch (${baseCtx}). ASK THEM OUT LOUD, in your own natural words (aap/tum), ONE gentle question: do you want me to hang up now, or shall I stay quietly? Then WAIT silently for their spoken answer — do not repeat the question.`;
+        } else if (this.silenceNudgeStreak > 6) {
+          promptText = `[QUIET COMPANION] ${baseCtx}. The student is deep in quiet work. Do NOT ask questions and do NOT end the call on your own. If you speak at all, say at most 1 short warm whisper acknowledging their focus (your own words), otherwise stay silently present.`;
         } else {
-          // Streak 1 on foreground audio
-          promptText = `[SYSTEM EVENT - CASUAL SILENCE BREAK]:
-SITUATION: You are live on a phone call and it has been quiet for ~${Math.round(silenceDurationSec)}s.
-HOW TO SPEAK: Break the silence naturally like a real friend on phone. Make a fresh, situational observation based on the time, what was being discussed, or what's on your mind. Never use repetitive robotic lines. 1 short sentence out loud now.]`;
+          promptText = `[CONTEXT UPDATE] ${baseCtx}`;
         }
 
         try {
           this.session.sendRealtimeInput({ text: promptText });
-          console.info(`[GeminiLive] Proactive silence nudge sent (streak=${this.silenceNudgeStreak}, silence=${Math.round(silenceDurationSec)}s, background=${isBackground}, vision=${isCameraOrScreen})`);
+          console.info(`[GeminiLive] Silence context update (streak=${this.silenceNudgeStreak} ask=${this.callEndAskCount})`);
         } catch (e) {
-          console.warn('[GeminiLive] Silence nudge error:', e);
+          console.warn('[GeminiLive] Silence context update error:', e);
         }
       }
     }, 2000);
@@ -2203,6 +2329,9 @@ HOW TO SPEAK: Break the silence naturally like a real friend on phone. Make a fr
       await this.connect(this.activeApiKey, {
         isIncomingCall: this.isIncomingCallSession,
         reason: this.incomingCallReason,
+        // Preserve 3-way origin across reconnect so greeting/origin block
+        // don't degrade to the wrong role mid-call.
+        origin: this.callOrigin,
       });
       // Review-8 P1: strict invariant — once the epoch is stale (a hangup landed
       // during the handshake/audio setup) this worker must not perform ANY
@@ -2355,6 +2484,20 @@ HOW TO SPEAK: Break the silence naturally like a real friend on phone. Make a fr
     if (!preserveReconnectState) {
       this.isIncomingCallSession = false;
       this.incomingCallReason = '';
+    }
+  }
+
+  /**
+   * P10 (drain-aware hang-up): resolve when Misa's current audio has fully
+   * played (bounded 0-8s). The endLiveCall handler awaits this BEFORE calling
+   * disconnect() — so the goodbye line is never cut mid-word by the fixed
+   * 4s guess. Exact for WebAudio (onended decrements), best-effort natively.
+   */
+  async waitForAudioDrained(maxWaitMs = 8000): Promise<void> {
+    const started = Date.now();
+    while (Date.now() - started < maxWaitMs) {
+      if (this.audioStreamer.getPendingPlaybackMs() <= 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 120));
     }
   }
 

@@ -28,6 +28,7 @@ import { TOOL_LABELS, type ChatToolMeta } from '../../core/domain/chat-tools';
 import type {
   LiveAudioRoute,
   LiveCameraLens,
+  LiveCallOrigin,
   LiveSessionStatus,
   LiveSettingsConfig,
   LiveStreamStats,
@@ -164,7 +165,7 @@ interface LiveCompanionOverlayProps {
   onExecuteTool?: (name: string, args: Record<string, unknown>) => Promise<any>;
   onTranscriptUpdate?: (transcripts: LiveTranscriptItem[]) => void;
   /** Incoming-call meta — AI ko batata hai ki usne call ki hai (nahi toh "student called you"). */
-  incomingCallMeta?: { isIncomingCall: boolean; reason?: string };
+  incomingCallMeta?: { isIncomingCall: boolean; reason?: string; origin?: LiveCallOrigin };
   /** True when the pre-capture path (permission modal / fast path) already acquired native audio focus. */
   audioFocusAlreadyGranted?: boolean;
   /** Imperative handle: ChatScreen sets this to the overlay's hang-up routine so
@@ -269,7 +270,19 @@ export default function LiveCompanionOverlay({
 
     // Expose the hang-up routine to ChatScreen so the `endLiveCall` live tool
     // can end the call programmatically. Cleared in the cleanup below.
-    if (endLiveCallRef) endLiveCallRef.current = handleEndCall;
+    // P10 drain-aware: the TOOL path first lets Misa's goodbye audio finish
+    // (0-8s, real pending playback — no fixed guess) before the line drops.
+    // The manual hang-up button keeps calling handleEndCall() DIRECTLY → instant.
+    if (endLiveCallRef) {
+      endLiveCallRef.current = () => {
+        void (async () => {
+          try {
+            await clientRef.current?.waitForAudioDrained();
+          } catch {}
+          handleEndCall();
+        })();
+      };
+    }
 
     const callbacks: LiveClientCallbacks = {
       onStatusChange: (newStatus) => {
@@ -361,7 +374,9 @@ export default function LiveCompanionOverlay({
     liveClient.setCallbacks(callbacks);
     if (!existingClient) {
       liveClient.setPrompts(systemPrompt, memoryContext, userPersona);
-      liveClient.setRecentChatHistory(initialMessages);
+      // ChatScreen already caps initialMessages at 25 (conversationHistoryLength);
+      // tell the client to keep that cap instead of its default 15.
+      liveClient.setRecentChatHistory(initialMessages, 25);
     }
     clientRef.current = liveClient;
     let cancelled = false;

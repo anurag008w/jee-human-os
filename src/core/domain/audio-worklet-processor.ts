@@ -34,7 +34,6 @@ const MisaAudioProcessor = class extends AudioWorkletProcessor {
     super();
     // Ring accumulates 128-frame render quanta up to a full 2048-sample block.
     this.ring = new Float32Array(4096);
-    this.pcm = new Int16Array(2048);   // 16k out of any input rate <= 48kHz
     this.out16k = new Float32Array(2048);
     this.fill = 0;
   }
@@ -85,19 +84,23 @@ const MisaAudioProcessor = class extends AudioWorkletProcessor {
       ii = next;
     }
 
-    // Float → 16-bit signed PCM (same clamping as the fallback path).
-    const pcm = this.pcm;
+// Float → 16-bit signed PCM (same clamping as the fallback path).
+    // IMPORTANT: use a FRESH buffer per chunk. postMessage(msg, [buffer])
+    // TRANSFERS (detaches) the ArrayBuffer — a long-lived reusable PCM array
+    // here would be sent already-detached on the next chunk and throw
+    // "DataCloneError: ArrayBuffer at index 0 is already detached". ~1.3KB per
+    // chunk at ~23 chunks/sec is negligible on the audio thread.
+    const send = new Int16Array(outLen);
     for (let i = 0; i < outLen; i++) {
       const s = Math.max(-1, Math.min(1, out16k[i]));
-      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      send[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
 
-    // Zero-copy hand-off: transfer the (ring-sized) buffer; the main thread
-    // reads only the used \`outLen\` samples. Reusing one buffer keeps the audio
-    // thread free of per-chunk allocations.
+    // Zero-copy hand-off: transfer the fresh buffer; the main thread reads
+    // only the used outLen samples.
     this.port.postMessage(
-      { kind: 'chunk', pcm: pcm.buffer, outLen: outLen, rms: rms },
-      [pcm.buffer],
+      { kind: 'chunk', pcm: send.buffer, outLen: outLen, rms: rms },
+      [send.buffer],
     );
     this.fill = 0;
     return true;

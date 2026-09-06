@@ -162,7 +162,7 @@ export default function App() {
     setTab('chat');
     window.dispatchEvent(
       new CustomEvent('levelup:start-live-call', {
-        detail: { reason: callEvent.reason, isIncomingCall: true },
+        detail: { reason: callEvent.reason, isIncomingCall: true, origin: callEvent.origin || 'auto' },
       })
     );
   };

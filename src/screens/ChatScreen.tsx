@@ -73,7 +73,7 @@ import {
   splitReplyIntoBubbles,
   type RevealSchedule,
 } from '../features/chat/message-segments';
-import type { LiveSettingsConfig, LiveTranscriptItem } from '../core/domain/live-types';
+import type { LiveSettingsConfig, LiveTranscriptItem, LiveCallOrigin } from '../core/domain/live-types';
 import { DEFAULT_LIVE_SETTINGS } from '../core/domain/live-types';
 import LivePermissionModal from '../components/live/LivePermissionModal';
 import LiveCompanionOverlay from '../components/live/LiveCompanionOverlay';
@@ -458,7 +458,7 @@ export default function ChatScreen({
    */
   const liveTranscriptTimerRef = useRef<number | null>(null);
   const liveTranscriptSnapshotRef = useRef<LiveTranscriptItem[] | null>(null);
-  const [liveIncomingMeta, setLiveIncomingMeta] = useState<{ isIncomingCall: boolean; reason?: string } | undefined>(undefined);
+  const [liveIncomingMeta, setLiveIncomingMeta] = useState<{ isIncomingCall: boolean; reason?: string; origin?: LiveCallOrigin } | undefined>(undefined);
   const [liveConfig, setLiveConfig] = useState<LiveSettingsConfig>(() => {
     const liveFromStore = container.store.get()?.aiSettings?.live;
     if (liveFromStore) return liveFromStore;
@@ -543,9 +543,9 @@ export default function ChatScreen({
     return provider?.baseUrl ? normalizeServerRoot(provider.baseUrl) : undefined;
   };
 
-  const handleStartLiveCall = async (meta?: { reason?: string; isIncomingCall?: boolean }) => {
+  const handleStartLiveCall = async (meta?: { reason?: string; isIncomingCall?: boolean; origin?: LiveCallOrigin }) => {
     haptic();
-    setLiveIncomingMeta(meta && meta.isIncomingCall ? { isIncomingCall: true, reason: meta.reason } : undefined);
+    setLiveIncomingMeta(meta && meta.isIncomingCall ? { isIncomingCall: true, reason: meta.reason, origin: meta.origin } : undefined);
     const key = getGeminiLiveApiKey();
     if (!key) {
       hapticError();
@@ -937,10 +937,11 @@ export default function ChatScreen({
       // previously endLiveCall had no handler, fell into the unknown-tool
       // fallback below, and surfaced an "error reading summary".
       if (name === 'endLiveCall') {
-        // Give Misa ~4s headroom to FINISH the sentence she's currently
-        // speaking before the call actually drops, so the goodbye isn't cut
-        // mid-word. Defer the hang-up; return the summary to the model now.
-        window.setTimeout(() => endLiveCallRef.current?.(), 4000);
+        // P10 drain-aware: the LiveCompanionOverlay ref wrapper first lets
+        // Misa's goodbye audio play to completion (0-8s, real pending playback
+        // ms from the streamer — no fixed 4s guess), then hangs up. We return
+        // the summary to the model immediately; the hang-up is async.
+        endLiveCallRef.current?.();
         const reason = String(args?.reason || '').trim();
         const summary = reason ? `Live call ended (${reason}).` : 'Live call ended.';
         return { ok: true, status: 'completed', result: summary, summary };
@@ -1600,6 +1601,10 @@ export default function ChatScreen({
     const match = /(^|\s)@([a-z]*)$/i.exec(value);
     if (match && toolCatalog.length > 0 && !streaming) setToolQuery(match[2] ?? '');
     else setToolQuery(null);
+    // Notify proactive service so its 20 s / 2 min idle timers don't fire
+    // while the user is actively composing a message. Throttled internally
+    // (saveState once per 20 s) so there's no localStorage churn per keystroke.
+    proactiveAgentService.recordTyping();
   }
 
   /** Pins a tool from the "@" picker: strips the "@query" text and adds a chip. */
@@ -1644,10 +1649,11 @@ export default function ChatScreen({
 
   useEffect(() => {
     const onStartLiveCallEvent = (e: Event) => {
-      const detail = (e as CustomEvent<{ reason?: string; isIncomingCall?: boolean }>).detail;
+      const detail = (e as CustomEvent<{ reason?: string; isIncomingCall?: boolean; origin?: LiveCallOrigin }>).detail;
       void handleStartLiveCallRef.current({
         reason: detail?.reason,
         isIncomingCall: detail?.isIncomingCall === true,
+        origin: detail?.origin,
       });
     };
     window.addEventListener('levelup:start-live-call', onStartLiveCallEvent);
@@ -2064,11 +2070,8 @@ export default function ChatScreen({
               container.store.get().memory.entries.length > 0
                 ? `[PERSISTENT USER MEMORIES]:\n${container.store.get().memory.entries.map((e) => `- ${e.content}`).join('\n')}`
                 : '',
-              active?.messages && active.messages.length > 0
-                ? `[EXISTING CHAT HISTORY IN THIS SESSION]:\n${active.messages
-                    .slice(-15)
-                    .map((m) => `${m.role === 'assistant' ? 'Misa' : 'User'}: ${m.content}`)
-                    .join('\n')}`
+              container.chat.getJourneyContext()
+                ? `[LIVE JOURNEY CONTEXT]:\n${container.chat.getJourneyContext()}`
                 : '',
             ]
               .filter(Boolean)
@@ -2076,7 +2079,13 @@ export default function ChatScreen({
           }
           initialMicStream={liveMicStream}
           initialCameraStream={liveCamStream || undefined}
-          initialMessages={active?.messages || []}
+          initialMessages={(() => {
+            const all = active?.messages || [];
+            const historyLen = container.store.get().aiSettings?.chat?.conversationHistoryLength;
+            // 0 = full history (chat jaisa), par live me cap 25
+            const limit = historyLen === 0 ? 25 : Math.min(historyLen ?? 15, 25);
+            return all.slice(-limit);
+          })()}
           toolCatalog={toolCatalog}
           endLiveCallRef={endLiveCallRef}
           config={{

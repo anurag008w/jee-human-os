@@ -203,6 +203,20 @@ export class ChatService {
   }
 
   /**
+   * Journey snapshot — same data chat messages inject into the system prompt,
+   * exposed here so live calls get the SAME journey context instead of a
+   * second, divergent copy.
+   */
+  getJourneyContext(): string {
+    try {
+      return this.contextProvider();
+    } catch (e) {
+      console.warn('[ChatService] Journey context unavailable:', e);
+      return '';
+    }
+  }
+
+  /**
    * Replaces ALL sessions (backup import). Invalidates the cached store and
    * clears any ephemeral sessions so a restored history is the only history.
    * Sessions are normalized and capped to the same limits the app enforces.

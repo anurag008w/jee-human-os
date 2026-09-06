@@ -11,12 +11,38 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { WORKLET_PROCESSOR_NAME, WORKLET_SOURCE } from '../audio-worklet-processor';
 
 // ── Hermetic AudioWorklet global scope ────────────────────────────────────
-function loadWorkletClass(sampleRate = 48000): { Processor: any; posts: ReturnType<typeof vi.fn>; name: string } {
+function loadWorkletClass(sampleRate = 48000, realMessageChannel = false): {
+  Processor: any;
+  posts: ReturnType<typeof vi.fn>;
+  name: string;
+  /** Resolves once ≥2 messages arrive on the far end (realMessageChannel only). */
+  received: () => Promise<any[]>;
+} {
   const posts = vi.fn();
   const registered: Array<[string, unknown]> = [];
+  let far: MessagePort | null = null;
 
+  // fake base port: a vi.fn() (postMessage never detaches).
+  // realMessageChannel: a genuine MessageChannel — transfers REALLY detach the
+  // buffer, exactly like the browser worklet's MessagePort. This catches the
+  // "reuse transferred buffer → DataCloneError" regression.
   class FakeProcessorBase {
-    port = { postMessage: posts };
+    port = realMessageChannel
+      ? (() => {
+          const { port1, port2 } = new MessageChannel();
+          far = port1;
+          const farMsgs: any[] = [];
+          port1.onmessage = (ev: MessageEvent) => farMsgs.push(ev.data);
+          port1.start();
+          return {
+            postMessage: (msg: unknown, transfer?: Transferable[]) => {
+              port2.postMessage(msg as any, transfer ?? []);
+              posts(msg, transfer);
+              void farMsgs; // farMsgs collected for `received()`
+            },
+          };
+        })()
+      : { postMessage: posts };
   }
 
   // Evaluate the worklet source with fake AudioWorklet globals. registerProcessor
@@ -38,7 +64,18 @@ function loadWorkletClass(sampleRate = 48000): { Processor: any; posts: ReturnTy
   scopeFn(FakeProcessorBase, (name: string, cls: unknown) => reg.register(name, cls), sampleRate, reg);
 
   const [name, Processor] = reg.registered[0];
-  return { Processor, posts, name };
+  const received = realMessageChannel
+    ? () =>
+        new Promise<any[]>((resolve) => {
+          if (!far) return resolve([]);
+          const msgs: any[] = [];
+          far.onmessage = (ev: MessageEvent) => {
+            msgs.push(ev.data);
+            if (msgs.length >= 2) resolve(msgs);
+          };
+        })
+    : () => Promise.resolve([]);
+  return { Processor, posts, name, received };
 }
 
 function pump(Processor: any, samplesPerQuantum: number, totalFrames: number, value = 0.5) {
@@ -97,6 +134,31 @@ describe('MisaAudioProcessor worklet source', () => {
       expect(bytes[i]).toBe(0xff);
       expect(bytes[i + 1]).toBe(0x3f);
     }
+  });
+
+  it('re-arms a FRESH buffer per chunk — a reused transferred buffer throws DataCloneError (real MessagePort)', async () => {
+    // Two full 2048-frame blocks → two postMessage transfers. The browser
+    // detaches the transferred ArrayBuffer; the old code kept writing+sending
+    // the same reusable PCM array and the SECOND transfer threw
+    // "DataCloneError: ArrayBuffer at index 0 is already detached".
+    const { Processor, posts, received } = loadWorkletClass(48000, true);
+    const inst = new Processor();
+    for (let block = 0; block < 2; block++) {
+      for (let q = 0; q < 16; q++) {
+        inst.process([[new Float32Array(128).fill(0.5)]]);
+      }
+    }
+    expect(posts).toHaveBeenCalledTimes(2);
+    // The recorded (sender-side) buffers are both detached by real transfers,
+    // but they must be DIFFERENT ArrayBuffer objects — never a reused one.
+    expect(posts.mock.calls[1][0].pcm).not.toBe(posts.mock.calls[0][0].pcm);
+    // The receiving end sees two fully intact 683-sample PCM chunks.
+    const msgs = await received();
+    expect(msgs).toHaveLength(2);
+    expect(msgs[1].pcm.byteLength).toBe(683 * 2);
+    const bytes = new Uint8Array(msgs[1].pcm);
+    expect(bytes[0]).toBe(0xff);
+    expect(bytes[1]).toBe(0x3f);
   });
 
   it('downsamples non-48k contexts by the same average-grouping rule', () => {

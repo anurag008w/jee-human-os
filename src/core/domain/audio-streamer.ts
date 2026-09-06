@@ -93,6 +93,17 @@ export class AudioStreamer {
   // scheduler feeds them to the DAC gaplessly. Absorbs weak-network gaps.
   private pendingChunks: AudioBuffer[] = [];
   private scheduleTimer: number | null = null;
+  // ── Pending playback tracker (drain-aware hang-up: P10) ──
+  // WebAudio is EXACT: incremented on schedule, decremented in each
+  // source.onended — no wall-clock guessing, so a goodbye is never cut early.
+  private pendingPlaybackMs = 0;
+  // Native GaplessAudioTrack has no per-chunk end signal; instead of summing
+  // durations (which over-counts when the decoder bursts faster than realtime
+  // and would make waitForAudioDrained block the FULL 8s every native call),
+  // we keep a rolling wall-clock DEADLINE: each write extends it to
+  // now+chunkDur, and MODE_STREAM drains each chunk at DAC rate, so the tail
+  // finishes ~one chunk after the last write. Best-effort, deliberate.
+  private nativePlaybackDeadline = 0;
 
   setOutputVolume(volume: number): void {
     this.outputVolume = Math.max(0, Math.min(1, volume));
@@ -366,6 +377,17 @@ export class AudioStreamer {
       } else if (this.nativeReady) {
         // Native is live: enqueue fire-and-forget. If a write happens to fail,
         // the module already logged it; we keep the native path (best-effort).
+        // No end-event from the AudioTrack → extend a rolling deadline so the
+        // drain wait finishes ~one chunk after the last write, never a whole
+        // reply duration later.
+        const spent = atob(pcm24kBase64);
+        const numSamples = Math.floor(spent.length / 2);
+        if (numSamples > 0) {
+          const speed = this.playbackSpeed && this.playbackSpeed > 0 ? this.playbackSpeed : 1.0;
+          const nativeDurMs = (numSamples / 24000) * 1000 * (1 / speed);
+          const deadline = Date.now() + nativeDurMs;
+          this.nativePlaybackDeadline = Math.max(this.nativePlaybackDeadline, deadline);
+        }
         void writeNativeAudioChunk(pcm24kBase64);
         return;
       }
@@ -483,6 +505,7 @@ export class AudioStreamer {
       const playDuration = audioBuffer.duration / speed;
       source.start(this.nextPlayTime);
       this.nextPlayTime += playDuration;
+      this.pendingPlaybackMs += playDuration * 1000;
       scheduled += playDuration;
 
       this.pendingChunks.shift();
@@ -495,6 +518,7 @@ export class AudioStreamer {
         // weak-network gap doesn't force a cold re-buffer mid-stream (the cause of
         // stutter). nextPlayTime is only zeroed by flushPlayback() (interruption,
         // turn boundary, hang-up) — the correct place to reset the timeline.
+        this.pendingPlaybackMs = Math.max(0, this.pendingPlaybackMs - playDuration * 1000);
         if (this.activeSources.length === 0) {
           this.onPlaybackEnded?.();
         }
@@ -534,7 +558,23 @@ export class AudioStreamer {
     }
     this.activeSources = [];
     this.nextPlayTime = 0;
+    this.pendingPlaybackMs = 0;
+    this.nativePlaybackDeadline = 0;
     if (notifyEnded) this.onPlaybackEnded?.();
+  }
+
+  /**
+   * Kitna Misa audio abhi bhi play hone ko baaki hai (ms).
+   * - WebAudio path is EXACT (onended decrements).
+   * - Native AudioTrack path is best-effort: a rolling deadline extended by
+   *   each write — resolves ~one chunk after the last write (never the full
+   *   reply duration, which would stall hang-ups by seconds).
+   * Used by liveClient.waitForAudioDrained() to hang up only after the goodbye
+   * audio has actually finished — never mid-word.
+   */
+  getPendingPlaybackMs(): number {
+    const native = this.nativePlaybackDeadline > 0 ? this.nativePlaybackDeadline - Date.now() : 0;
+    return Math.max(0, this.pendingPlaybackMs) + Math.max(0, native);
   }
 
   private startLevelMonitoring(): void {

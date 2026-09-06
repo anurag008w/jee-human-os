@@ -20,6 +20,7 @@
 //              prefs without clobbering live progress)
 
 import type { HttpClient } from '../../infra/ai/http';
+import { HttpError } from '../../infra/ai/http';
 import type { AuthSession } from '../../lib/auth';
 import type { AppState } from '../../core/domain/state';
 import type { ChatStoreState } from '../../core/domain/chat';
@@ -41,6 +42,8 @@ export interface SyncPushResult {
   updatedAt: string;
   status?: number;
   message?: string;
+  /** True when the FINAL error was a 401/403 — the stored session is invalid. */
+  auth?: boolean;
 }
 
 /** What a scope is syncing right now — surfaced in the Settings UI. */
@@ -89,20 +92,44 @@ export class SyncService {
     this.http = http;
   }
 
-  private headers(session: AuthSession): Record<string, string> {
-    return { Authorization: `Bearer ${session.token || session.apiKey}`, 'Content-Type': 'application/json' };
+  private headers(session: AuthSession, bearer?: string): Record<string, string> {
+    return { Authorization: `Bearer ${bearer ?? session.token ?? session.apiKey ?? ''}`, 'Content-Type': 'application/json' };
+  }
+
+  /**
+   * P11 guarded re-auth: runs the request with the stored token; on a 401/403
+   * retries ONCE with the long-lived apiKey — the SAME stored credential chat
+   * already uses (token expiry/restart does NOT invalidate the apiKey). This
+   * is never /auth/login: no password exists, so the apiKey fallback IS the
+   * re-auth. Callers like status/scopes/pull still swallow the final error
+   * (best-effort), but push() surfaces `auth: true` when both failed so the
+   * coordinator can back off instead of spamming 401s.
+   */
+  private async requestWithAuth<T>(session: AuthSession, run: (bearer: string) => Promise<T>): Promise<T> {
+    try {
+      return await run(session.token || (session.apiKey ?? ''));
+    } catch (err) {
+      const first = session.token || (session.apiKey ?? '');
+      const fallback = session.apiKey;
+      if (err instanceof HttpError && err.kind === 'auth' && fallback && fallback !== first) {
+        return await run(fallback); // silent same-credential re-auth
+      }
+      throw err;
+    }
   }
 
   /** Server status for one scope (exists / updated_at / size). */
   async status(session: AuthSession, scope: SyncScope): Promise<SyncStatus> {
     try {
-      const res = await this.http.requestJson<SyncStatusResponse>({
-        url: `${session.serverUrl}/sync/status?scope=${scope}`,
-        method: 'GET',
-        headers: this.headers(session),
-        timeoutMs: 10_000,
-        retries: 1,
-      });
+      const res = await this.requestWithAuth(session, (bearer) =>
+        this.http.requestJson<SyncStatusResponse>({
+          url: `${session.serverUrl}/sync/status?scope=${scope}`,
+          method: 'GET',
+          headers: this.headers(session, bearer),
+          timeoutMs: 10_000,
+          retries: 1,
+        }),
+      );
       return { exists: res.exists === true, updatedAt: res.updated_at ?? '', bytes: res.bytes ?? 0 };
     } catch {
       return { exists: false, updatedAt: '', bytes: 0 };
@@ -112,13 +139,15 @@ export class SyncService {
   /** Which scopes the server has for this user (fresh install pull hint). */
   async scopes(session: AuthSession): Promise<SyncScope[]> {
     try {
-      const res = await this.http.requestJson<{ scopes?: string[] }>({
-        url: `${session.serverUrl}/sync/scopes`,
-        method: 'GET',
-        headers: this.headers(session),
-        timeoutMs: 10_000,
-        retries: 1,
-      });
+      const res = await this.requestWithAuth(session, (bearer) =>
+        this.http.requestJson<{ scopes?: string[] }>({
+          url: `${session.serverUrl}/sync/scopes`,
+          method: 'GET',
+          headers: this.headers(session, bearer),
+          timeoutMs: 10_000,
+          retries: 1,
+        }),
+      );
       const known: SyncScope[] = ['state', 'chat', 'settings', 'misa'];
       return (res.scopes ?? []).filter((s): s is SyncScope => (known as string[]).includes(s));
     } catch {
@@ -129,13 +158,15 @@ export class SyncService {
   /** Pull one scope from the server. Returns the raw payload (null when absent). */
   async pull(session: AuthSession, scope: SyncScope): Promise<{ updatedAt: string; state: unknown } | null> {
     try {
-      const res = await this.http.requestJson<SyncGetResponse>({
-        url: `${session.serverUrl}/sync/state?scope=${scope}`,
-        method: 'GET',
-        headers: this.headers(session),
-        timeoutMs: 15_000,
-        retries: 1,
-      });
+      const res = await this.requestWithAuth(session, (bearer) =>
+        this.http.requestJson<SyncGetResponse>({
+          url: `${session.serverUrl}/sync/state?scope=${scope}`,
+          method: 'GET',
+          headers: this.headers(session, bearer),
+          timeoutMs: 15_000,
+          retries: 1,
+        }),
+      );
       if (!res.exists) return null;
       return { updatedAt: res.updated_at ?? '', state: res.state ?? {} };
     } catch {
@@ -146,21 +177,24 @@ export class SyncService {
   /** Push one scope to the server (push-authoritative, last-write-wins). */
   async push(session: AuthSession, scope: SyncScope, state: unknown, updatedAt: string): Promise<SyncPushResult> {
     try {
-      const res = await this.http.requestJson<SyncPutResponse>({
-        url: `${session.serverUrl}/sync/state?scope=${scope}`,
-        method: 'PUT',
-        headers: this.headers(session),
-        body: { state, updated_at: updatedAt },
-        timeoutMs: 15_000,
-        retries: 1,
-      });
+      const res = await this.requestWithAuth(session, (bearer) =>
+        this.http.requestJson<SyncPutResponse>({
+          url: `${session.serverUrl}/sync/state?scope=${scope}`,
+          method: 'PUT',
+          headers: this.headers(session, bearer),
+          body: { state, updated_at: updatedAt },
+          timeoutMs: 15_000,
+          retries: 1,
+        }),
+      );
       return { ok: res.ok === true, updatedAt: res.updated_at ?? updatedAt };
     } catch (err) {
       return {
         ok: false,
         updatedAt: updatedAt,
-        status: err instanceof Error ? 0 : undefined,
+        status: err instanceof HttpError ? err.status : undefined,
         message: err instanceof Error ? err.message : String(err),
+        auth: err instanceof HttpError && err.kind === 'auth',
       };
     }
   }
@@ -171,13 +205,15 @@ export class SyncService {
    *  back to the loop, so a failure here is never fatal. */
   async forceServerPush(session: AuthSession): Promise<boolean> {
     try {
-      const res = await this.http.requestJson<{ pushed?: boolean }>({
-        url: `${session.serverUrl}/admin/sync/now`,
-        method: 'POST',
-        headers: this.headers(session),
-        timeoutMs: 15_000,
-        retries: 0,
-      });
+      const res = await this.requestWithAuth(session, (bearer) =>
+        this.http.requestJson<{ pushed?: boolean }>({
+          url: `${session.serverUrl}/admin/sync/now`,
+          method: 'POST',
+          headers: this.headers(session, bearer),
+          timeoutMs: 15_000,
+          retries: 0,
+        }),
+      );
       return res.pushed === true;
     } catch {
       return false;
@@ -187,16 +223,46 @@ export class SyncService {
   /** Delete the user's whole sync folder on the server (logout wipe). */
   async wipe(session: AuthSession): Promise<boolean> {
     try {
-      const res = await this.http.requestJson<SyncDeleteResponse>({
-        url: `${session.serverUrl}/sync/state?scope=*`,
-        method: 'DELETE',
-        headers: this.headers(session),
-        timeoutMs: 15_000,
-        retries: 1,
-      });
+      const res = await this.requestWithAuth(session, (bearer) =>
+        this.http.requestJson<SyncDeleteResponse>({
+          url: `${session.serverUrl}/sync/state?scope=*`,
+          method: 'DELETE',
+          headers: this.headers(session, bearer),
+          timeoutMs: 15_000,
+          retries: 1,
+        }),
+      );
       return res.deleted === true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * P11: cheap credential validation → 'ok' | 'auth' | 'network' | 'server'.
+   * Both the token AND the apiKey fallback are exercised by requestWithAuth —
+   * so 'auth' means the server rejected BOTH stored credentials (banned /
+   * removed server-side) and the coordinator can stop silently retrying.
+   */
+  async probe(session: AuthSession): Promise<'ok' | 'auth' | 'network' | 'server'> {
+    try {
+      await this.requestWithAuth(session, (bearer) =>
+        this.http.requestJson<SyncStatusResponse>({
+          url: `${session.serverUrl}/sync/status?scope=settings`,
+          method: 'GET',
+          headers: this.headers(session, bearer),
+          timeoutMs: 10_000,
+          retries: 0,
+        }),
+      );
+      return 'ok';
+    } catch (err) {
+      if (err instanceof HttpError) {
+        if (err.kind === 'auth') return 'auth';
+        if (err.kind === 'network' || err.kind === 'timeout') return 'network';
+        return 'server';
+      }
+      return 'network';
     }
   }
 }

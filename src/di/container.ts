@@ -146,6 +146,15 @@ export function createContainer(
         relationshipManager.replaceFromSync(data.relationship);
         void getProactiveSvc().then((proactive) => proactive.replaceFromSync(data.proactive));
       },
+      // P11 guarded re-auth: re-apply the SAME long-lived apiKey to the gateway
+      // (the credential chat already uses via configureServerAuth) — never
+      // /auth/login, because no password is stored. Lazy-import keeps the
+      // container↔lib/auth module graph acyclic.
+      applyServerCredential: (session) => {
+        void import('../lib/auth').then(({ ensureV1Base }) => {
+          providerSettings.configureServerAuth(ensureV1Base(session.serverUrl), session.apiKey);
+        });
+      },
     },
     { debounceMs: opts.syncDebounceMs },
   );
