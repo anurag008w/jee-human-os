@@ -8,6 +8,13 @@
 
 set -e
 
+# --dry-run: sirf report karo, kuch likho/commit mat karo (npm run release:dry)
+DRY_RUN=0
+if [[ "$1" == "--dry-run" ]]; then
+    DRY_RUN=1
+    shift
+fi
+
 # Get version from argument or generate from date
 if [ -n "$1" ]; then
     VERSION="$1"
@@ -58,6 +65,37 @@ fi
 
 echo ""
 echo "✅ All tests passed!"
+echo ""
+
+# ---- Release ke last step: app version ko saari jagah sync karo ----
+# package.json (source of truth) + README/manifest/index.html/capacitor me
+# stale occurrences — release-version.mjs exact old-string replace karta hai,
+# koi funny file nahi todta (src/ kabhi scan nahi hota). Invalid version →
+# script exit 1 → set -e se release abort.
+echo "🔖 Syncing app version everywhere..."
+if [[ "$DRY_RUN" == "1" ]]; then
+  VERSION_SYNC="$(node scripts/release-version.mjs --set "$VERSION" --dry-run)"
+else
+  VERSION_SYNC="$(node scripts/release-version.mjs --set "$VERSION")"
+fi
+echo "$VERSION_SYNC"
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo ""
+  echo "⏳ DRY RUN — kuch commit nahi hua. Asli release ke liye: npm run release -- \"$VERSION\""
+  exit 0
+fi
+
+VERSION_FILES="package.json package-lock.json README.md README.EN.md index.html public/manifest.json public/sw.js capacitor.config.ts capacitor.config.json"
+DIRTY_VERSION_FILES=$(git status --porcelain -- $VERSION_FILES)
+if [ -n "$DIRTY_VERSION_FILES" ]; then
+  git add $VERSION_FILES
+  git commit -m "chore(release): bump app version to ${VERSION#v}"
+  echo "✅ Version bump committed"
+else
+  echo "ℹ️  No version files changed — version already synced"
+fi
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
