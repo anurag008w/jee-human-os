@@ -183,4 +183,54 @@ describe('ProactiveAgentService Production Hardening', () => {
     const remaining = (proactiveAgentService as any).scheduledMessages as any[];
     expect(remaining.length).toBe(0);
   });
+
+  it('12. user_tool makeCall bypasses callsEnabled-off + recent-call interval; auto calls still gated', () => {
+    proactiveAgentService.updatePreferences({
+      quietHoursStart: '00:00',
+      quietHoursEnd: '00:00',
+    });
+
+    let calls = 0;
+    const unsub = proactiveAgentService.onIncomingCall(() => {
+      calls += 1;
+    });
+
+    // 1. Auto call abhi hui — interval timestamp filled.
+    expect(proactiveAgentService.triggerIncomingCall('Auto periodic')).toBe(true);
+    expect(calls).toBe(1);
+
+    // 2. Calls disable kar do.
+    proactiveAgentService.updatePreferences({ callsEnabled: false });
+
+    // 3. User ne khud makeCall kaha (origin user_tool) → callsEnabled off +
+    //    recent-call interval ke bawajood fire hona chahiye (explicit request).
+    expect(proactiveAgentService.triggerIncomingCall('Study check-in', 'user_tool')).toBe(true);
+    expect(calls).toBe(2);
+
+    // 4. Auto calls still respect the gates → blocked.
+    expect(proactiveAgentService.triggerIncomingCall('Auto again')).toBe(false);
+    expect(calls).toBe(2);
+
+    unsub();
+  });
+
+  it('13. makeCall tool dispatch suppresses the onChatTurn heuristic backup (no duplicate fire)', () => {
+    let calls = 0;
+    const unsub = proactiveAgentService.onIncomingCall(() => {
+      calls += 1;
+    });
+
+    // Model ka makeCall tool dispatch hua → 1 call.
+    expect(proactiveAgentService.triggerIncomingCall('Study check-in', 'user_tool')).toBe(true);
+    expect(calls).toBe(1);
+
+    // Usi turn ka post-reply heuristic backup — guard ke wajah se skip (0 extra).
+    proactiveAgentService.onChatTurn('mujhe call karo', 'Ok, calling you now');
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(5000);
+    vi.useRealTimers();
+    expect(calls).toBe(1);
+
+    unsub();
+  });
 });

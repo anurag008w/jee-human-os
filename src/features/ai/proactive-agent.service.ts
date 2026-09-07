@@ -263,6 +263,8 @@ class ProactiveAgentService {
   private lastTypingPersistAt = 0;
   private lastCallTimestamp = 0;
   private lastCallDeclinedTimestamp = 0;
+  /** Jab user_tool call (makeCall tool) dispatch ho — duplicate heuristic backup rokhne ke liye. */
+  private lastUserToolCallTimestamp = 0;
   private consecutiveCallDeclines = 0;
   private dndUntilTimestamp = 0;
   private coldStartDone = false;
@@ -765,8 +767,8 @@ class ProactiveAgentService {
   }
 
   /** AI tool ke liye: abhi turant call karo. (Student asked via @ tool → origin user_tool) */
-  makeCall(reason: string): void {
-    this.triggerIncomingCall(reason || 'Misa call kar rahi hai', 'user_tool');
+  makeCall(reason: string): boolean {
+    return this.triggerIncomingCall(reason || 'Misa call kar rahi hai', 'user_tool');
   }
 
   /** AI tool ke liye: cancel/delete a scheduled item by id. */
@@ -1330,6 +1332,12 @@ Instructions:
       lowerUser.includes('call karna') ||
       lowerUser.includes('mujhe call')
     ) {
+      // Dedupe: agar model ke makeCall TOOL ne isi turn me already incoming
+      // call fire kiya (lastUserToolCallTimestamp just set hua), toh heuristic
+      // backup timer schedule NAHI karo — warna "call karo" pe 1.8s baad
+      // duplicate incoming-call modal aayega. Tool path fail hua ho toh
+      // timestamp purana hota hai aur backup zinda rehta hai.
+      if (Date.now() - this.lastUserToolCallTimestamp < 30 * 1000) return;
       this.chatCallTimer = setTimeout(() => {
         this.chatCallTimer = null;
         this.triggerIncomingCall('User ne chat me call karne ko kaha', 'user_tool');
@@ -1712,8 +1720,14 @@ Instructions:
   }
 
   triggerIncomingCall(reason = 'Study check-in', origin: LiveCallOrigin = 'auto'): boolean {
-    if (!this.prefs.callsEnabled) return false;
-    if (this.isQuietTime()) return false;
+    // Student ne EXPLICITLY call request kiya hai (chat tool makeCall ya "call
+    // karo" intent — origin 'user_tool'). Is case me proactive rate-limits
+    // apply NAHI karte: user khud maang raha hai, isliye callsEnabled /
+    // quiet-time / call-interval / decline-penalty sab bypass. Sirf live-call-
+    // active guard rehta hai (duplicate modal na bane).
+    const userRequested = origin === 'user_tool';
+    if (!this.prefs.callsEnabled && !userRequested) return false;
+    if (this.isQuietTime() && !userRequested) return false;
     // P5 (hang-fix): never fire a second incoming-call while a live call is
     // already active — the overlay is open and a duplicate modal is jarring.
     if (isLiveCallActive()) return false;
@@ -1722,15 +1736,27 @@ Instructions:
     const minCallInterval = this.prefs.callFrequency === 'rare' ? 4 * 24 * 3600 * 1000 : 2 * 24 * 3600 * 1000;
     const declinePenaltyMs = (3 + this.consecutiveCallDeclines) * 24 * 3600 * 1000;
 
-    if (now - this.lastCallDeclinedTimestamp < declinePenaltyMs && !reason.includes('User ne')) {
+    if (now - this.lastCallDeclinedTimestamp < declinePenaltyMs && !userRequested) {
       return false;
     }
-    if (now - this.lastCallTimestamp < minCallInterval && !reason.includes('User ne')) {
+    if (now - this.lastCallTimestamp < minCallInterval && !userRequested) {
       return false;
     }
 
     this.lastCallTimestamp = now;
     this.saveState();
+
+    // Dedupe: agar model ka makeCall TOOL fire ho chuka hai (user_tool), toh
+    // onChatTurn ka heuristic backup timer cancel kar do — warna "call karo"
+    // pe darke dono paths fire honge aur duplicate incoming-call modal bane.
+    // Yahan clear isliye karte hain (dispatch hote waqt), upar nahi: agar call
+    // kisi vajah se blocked ho (live call active), backup timer zinda rehna
+    // chahiye taaki wo bhi same gate se refuse kare.
+    if (userRequested && this.chatCallTimer !== null) {
+      clearTimeout(this.chatCallTimer);
+      this.chatCallTimer = null;
+    }
+    if (userRequested) this.lastUserToolCallTimestamp = now;
 
     const callEvent: IncomingCallEvent = {
       callId: `call_${now}`,
@@ -1986,6 +2012,7 @@ Instructions:
     this.lastUserChatTimestamp = 0;
     this.lastCallTimestamp = 0;
     this.lastCallDeclinedTimestamp = 0;
+    this.lastUserToolCallTimestamp = 0;
     this.consecutiveCallDeclines = 0;
     this.dndUntilTimestamp = 0;
     this.coldStartDone = false;

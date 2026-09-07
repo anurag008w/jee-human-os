@@ -64,13 +64,19 @@ function runProactiveAction(action: ChatToolAction): Promise<ChatToolResult> {
       case 'makeCall': {
         return getProactive().then((svc) => {
           try {
-            svc.makeCall(action.reason);
+            const fired = svc.makeCall(action.reason);
+            // triggerIncomingCall false return kare toh silent-fail mat karo —
+            // model ko batao ki call start kyun nahi ho payi, warna narration
+            // "call ho gaya" bolegi aur kuch hua hi nahi hoga.
+            if (fired === false) {
+              return { ok: false, summary: 'makeCall abhi start nahi ho sakti — pehle se ek live call active hai ya calls disabled/quiet-time pe hain. Student se yehi keh dena.' };
+            }
+            return { ok: true, summary: 'Call shuru ki ja rahi hai abhi. IncomingCall popup dikhega.' };
           } catch (e: any) {
             // makeCall internal failure ko bhi graceful summary me convert kar do —
             // live call tool path kabhi throw/reject nahi hona chahiye.
             return { ok: false, summary: `makeCall init fail: ${e?.message || 'unknown error'}` };
           }
-          return { ok: true, summary: 'Call shuru ki ja rahi hai abhi. IncomingCall popup dikhega.' };
         });
       }
       case 'listScheduled': {
@@ -141,9 +147,12 @@ ACTIONS.register({ id: 'deleteMemory', label: 'Delete memory', description: 'Del
 ACTIONS.register({ id: 'pinMemory', label: 'Pin memory', description: 'Pin entry to long-term memory.', entityType: 'appState', permissions: ['edit'] });
 ACTIONS.register({ id: 'unpinMemory', label: 'Unpin memory', description: 'Unpin entry from long-term memory.', entityType: 'appState', permissions: ['edit'] });
 // Proactive: scheduleMessage / makeCall / scheduleCall / listScheduled / cancelScheduled
-ACTIONS.register({ id: 'scheduleMessage', label: 'Schedule a message', description: 'Misa a future-time message schedule kar sakti hai — user ko yaad dilane ke liye.', entityType: 'appState', permissions: ['edit'], confirmationRequired: true });
-ACTIONS.register({ id: 'makeCall', label: 'Call student now', description: 'Misa abhi user ko ek proactive call kar sakti hai.', entityType: 'appState', permissions: ['edit'], confirmationRequired: true });
-ACTIONS.register({ id: 'scheduleCall', label: 'Schedule a call', description: 'Misa a future-time call schedule kar sakti hai user ke saath.', entityType: 'appState', permissions: ['edit'], confirmationRequired: true });
+// NOTE: koi confirmationRequired nahi — ye tools hamesha user ke EXPLICIT request par
+// hi chalte hain (model ko PROACTIVE TOOLS section me "only when the student
+// explicitly asks" likha hai), isliye ek aur Yes/No permission step redundant hai.
+ACTIONS.register({ id: 'scheduleMessage', label: 'Schedule a message', description: 'Misa a future-time message schedule kar sakti hai — user ko yaad dilane ke liye.', entityType: 'appState', permissions: ['edit'] });
+ACTIONS.register({ id: 'makeCall', label: 'Call student now', description: 'Misa abhi user ko ek proactive call kar sakti hai.', entityType: 'appState', permissions: ['edit'] });
+ACTIONS.register({ id: 'scheduleCall', label: 'Schedule a call', description: 'Misa a future-time call schedule kar sakti hai user ke saath.', entityType: 'appState', permissions: ['edit'] });
 ACTIONS.register({ id: 'listScheduled', label: 'List scheduled', description: 'Scheduled messages/calls list karo.', entityType: 'appState', permissions: ['read'] });
 ACTIONS.register({ id: 'cancelScheduled', label: 'Cancel scheduled', description: 'A scheduled message/call cancel karo.', entityType: 'appState', permissions: ['delete'] });
 
