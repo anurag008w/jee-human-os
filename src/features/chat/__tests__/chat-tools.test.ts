@@ -1783,7 +1783,23 @@ describe('ChatService tool retry + reasoning', () => {
   });
 
   it('reports status while executing tools and passes thinking level', async () => {
+    // The active provider offers the pinned model (must be honored by resolveModel).
     const store = makeStore();
+    store.save({
+      ...store.get(),
+      aiSettings: {
+        ...store.get().aiSettings,
+        providers: {
+          openrouter: {
+            id: 'openrouter' as ProviderId,
+            label: 'OpenRouter',
+            model: 'custom-tool-model',
+            models: ['custom-tool-model'],
+            enabled: true,
+          },
+        },
+      },
+    });
     const { tools } = makeTools(store);
     const requests: LLMRequest[] = [];
     const provider: LLMProvider = {

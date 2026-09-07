@@ -30,7 +30,7 @@ export class FetchHttpClient implements HttpClient {
   private readonly defaultTimeoutMs: number;
   private readonly defaultRetries: number;
 
-  constructor(fetchFn: typeof fetch = fetch, defaultTimeoutMs = 120_000, defaultRetries = 1) {
+  constructor(fetchFn: typeof fetch = fetch, defaultTimeoutMs = 120_000, defaultRetries = 3) {
     // Binding keeps `this` = globalThis so the browser's `window.fetch` can be
     // invoked detached; otherwise Chrome throws "Illegal invocation".
     this.fetchFn = fetchFn.bind(globalThis) as typeof fetch;
@@ -60,7 +60,7 @@ export class FetchHttpClient implements HttpClient {
       } catch (err) {
         lastError = err;
         if (isRetryable(err) && attempt < retries) {
-          await delayMs(backoffMs(attempt));
+          await delayMs(backoffMs(attempt, err instanceof HttpError ? err.status : undefined));
           continue;
         }
         throw lastError;
@@ -211,7 +211,14 @@ function isRetryable(err: unknown): boolean {
   return true; // network / timeout
 }
 
-function backoffMs(attempt: number): number {
+/**
+ * Backoff between retries. Rate limits (429) get a much longer, capped
+ * backoff: retrying a 429 after 100ms just extends the server's lockout
+ * window and deepens the 429 storm (every chain provider sharing the same
+ * gateway key hits the same wall). Everything else keeps a snappy retry.
+ */
+function backoffMs(attempt: number, status?: number): number {
+  if (status === 429) return Math.min(2000 * Math.pow(2, attempt), 30_000);
   return Math.min(100 * Math.pow(2, attempt), 2000);
 }
 

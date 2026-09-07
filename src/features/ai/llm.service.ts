@@ -12,6 +12,10 @@ interface ChainEntry {
  * Resilient LLM facade: tries the active provider (and its fallback model),
  * then every other usable provider in order, then the hidden env default.
  * Failures on one provider never surface before the whole chain is exhausted.
+ *
+ * Every provider is ALWAYS attempted — a 429 on one baseUrl never blocks
+ * another provider from being tried (the LLM facade layers on top of the HTTP
+ * client's own retry/backoff, which is where transient failures are absorbed).
  */
 export class LLMService {
   private readonly factory: ProviderFactory;
@@ -57,7 +61,7 @@ export class LLMService {
         lastError = err;
       }
     }
-    throw lastError;
+    throw friendlyRateLimitError(lastError);
   }
 
   private buildProviderChain(providerId: string, requestedModel?: string): ChainEntry[] {
@@ -106,6 +110,24 @@ export class LLMService {
     if (!active) throw new ProviderError('none', 'bad-request', 'no usable provider configured');
     return active;
   }
+}
+
+/**
+ * The final error users see when every chain entry is exhausted. A bare
+ * "HTTP 429" gives no hint of what to do; wrap rate-limit failures in an
+ * actionable Hinglish message (other kinds keep their provider message).
+ */
+function friendlyRateLimitError(err: unknown): unknown {
+  const pe = err as ProviderError | undefined;
+  if (pe && pe.kind === 'rate-limit') {
+    return new ProviderError(
+      pe.provider,
+      'rate-limit',
+      'Rate limit hit gaya (429) — server busy hai. 1-2 minute ruk ke dobara try karo, ya Settings se koi aur provider/model chuno.',
+      pe.status ?? 429,
+    );
+  }
+  return err;
 }
 
 export type { LLMMessage };

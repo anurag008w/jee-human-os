@@ -222,4 +222,18 @@ describe('ProviderSettingsService', () => {
     settings.configureServerAuth('https://smartrotator.onrender.com/v1', '');
     expect(settings.getActiveProvider()).toBeNull();
   });
+
+  it('configureServerAuth never invents a phantom upstream model — falls back to verified gateway groups', () => {
+    // Regression: builds without VITE_DEFAULT_AI_* used to hardcode
+    // 'gemini-2.5-flash' (absent from the SmartRotator /v1/models catalog),
+    // which made EVERY chat request to the gateway fail with 429/503 while
+    // Live (different model chain) kept working.
+    const settings = build({ providers: {}, activeProviderId: null, aiEnabled: false });
+    settings.configureServerAuth('https://smartrotator.onrender.com/v1', 'sk-user');
+    const full = settings.getHiddenDefaultFull();
+    expect(full?.model).toBe('levelup');
+    expect(full?.models).toEqual(['levelup', 'levelup-lite']);
+    const stored = settings.listStoredProviders();
+    expect(stored.find((p) => p.model === 'gemini-2.5-flash')).toBeUndefined();
+  });
 });

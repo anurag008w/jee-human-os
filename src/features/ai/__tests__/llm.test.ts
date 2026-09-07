@@ -52,6 +52,28 @@ function failingProviderFor(id: ProviderId): LLMProvider {
   return responder;
 }
 
+function rateLimitedProviderFor(id: ProviderId, message = 'HTTP 429 toomanyrequests'): LLMProvider {
+  const err: ProviderError = Object.assign(new Error(message), {
+    kind: 'rate-limit',
+    provider: id,
+    status: 429,
+  }) as ProviderError;
+  const responder = {
+    id,
+    label: id,
+    isConfigured: () => true,
+    complete: async (): Promise<LLMResponse> => {
+      throw err;
+    },
+    stream: async (): Promise<LLMResponse> => {
+      throw err;
+    },
+    fetchModels: async (): Promise<ModelInfo[]> => [],
+    healthCheck: async (): Promise<HealthCheckResult> => ({ ok: false, provider: id, latencyMs: 1 }),
+  };
+  return responder;
+}
+
 function buildService(
   providers: Record<string, LLMProvider>,
   aiSettings: Partial<AppState['aiSettings']>,
@@ -184,6 +206,55 @@ describe('LLMService', () => {
     const completeRes = await svc.complete({ messages: [{ role: 'user', content: 'x' }] });
     expect(completeRes.text).toBe('complete');
     expect(completeCalls).toBe(1);
+  });
+
+  it('still tries other providers on the same baseUrl after a 429 (no cooldown) and wraps with a friendly message', async () => {
+    const GW_BASE = 'https://smartrotator.test/v1';
+    let openrouterCalled = false;
+    const openrouter = providerFor('openrouter', 'big-pickle', 'should not run');
+    openrouter.complete = async (): Promise<LLMResponse> => {
+      openrouterCalled = true;
+      return { text: 'should not run', model: 'big-pickle' };
+    };
+    const svc = buildService(
+      {
+        custom: rateLimitedProviderFor('custom'),
+        openrouter,
+      },
+      {
+        providers: {
+          custom: { id: 'custom', label: 'Default', model: 'levelup', baseUrl: GW_BASE, enabled: true },
+          openrouter: { id: 'openrouter', label: 'OpenRouter', model: 'big-pickle', baseUrl: GW_BASE, enabled: true },
+        },
+        activeProviderId: 'custom',
+        aiEnabled: true,
+      },
+    );
+    const res = await svc.complete({ messages: [{ role: 'user', content: 'x' }] });
+    // Even though the first provider rate-limited, the next provider on the
+    // SAME baseUrl is still attempted — the LLM facade never blocks a provider
+    // because of a previous failure (retry/backoff lives in the HTTP client).
+    expect(openrouterCalled).toBe(true);
+    expect(res.text).toBe('should not run');
+  });
+
+  it('falls through to the next provider after a 429 on the first', async () => {
+    const svc = buildService(
+      {
+        custom: rateLimitedProviderFor('custom'),
+        openrouter: providerFor('openrouter', 'a', 'fallback ok'),
+      },
+      {
+        providers: {
+          custom: { id: 'custom', label: 'Default', model: 'levelup', baseUrl: 'https://gw-a.test/v1', enabled: true },
+          openrouter: { id: 'openrouter', label: 'OpenRouter', model: 'a', baseUrl: 'https://openrouter.ai/api/v1', enabled: true },
+        },
+        activeProviderId: 'custom',
+        aiEnabled: true,
+      },
+    );
+    const res = await svc.complete({ messages: [{ role: 'user', content: 'x' }] });
+    expect(res.text).toBe('fallback ok');
   });
 
   it('aborted errors are not swallowed by the fallback chain', async () => {

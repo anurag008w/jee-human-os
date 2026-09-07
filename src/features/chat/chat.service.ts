@@ -1484,12 +1484,29 @@ export class ChatService {
     return extractedAny;
   }
 
+  /**
+   * Resolve the model a session's messages must use. A pinned `prefs.model`
+   * is ONLY honored when the target provider actually offers it — a stale
+   * pin (e.g. a picker model that no longer exists on this provider, like the
+   * old phantom "gemini-2.5-flash" gateway id) would otherwise short-circuit
+   * the entire LLM fallback chain on every message and lock the user into
+   * permanent 429/503 failures. Falling back to the provider's configured
+   * model keeps auto-recovery working after fixes.
+   */
   private resolveModel(session: ChatSession): string | undefined {
+    const pinned = session.prefs.model;
     if (session.prefs.providerId) {
       const config = this.settings.getProviderById(session.prefs.providerId);
-      if (config) return session.prefs.model ?? config.model ?? undefined;
+      if (!config) return pinned ?? undefined;
+      const offered = Boolean(pinned && (config.models?.includes(pinned) || pinned === config.model));
+      return offered && pinned ? pinned : config.model ?? undefined;
     }
-    return session.prefs.model ?? undefined;
+    if (!pinned) return undefined;
+    // No explicit provider: only pin when the ACTIVE provider offers it —
+    // otherwise let the full provider chain resolve a valid model.
+    const active = this.settings.getActiveProvider();
+    if (!active) return undefined;
+    return active.models?.includes(pinned) || pinned === active.model ? pinned : undefined;
   }
 
   /** Chat preference wins; otherwise the provider's configured thinking level. */

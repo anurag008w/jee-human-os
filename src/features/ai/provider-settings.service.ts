@@ -5,6 +5,17 @@ import { buildHiddenDefaultConfig } from '../../infra/ai/provider-factory';
 import { providerLabel } from '../../infra/ai/provider-factory';
 
 /**
+ * SmartRotator (LevelUp gateway) model GROUP ids. The gateway exposes group
+ * ids ("levelup", "levelup-lite", ...) — NOT raw upstream model names. Sending
+ * a name the gateway doesn't list (e.g. the old hardcoded "gemini-2.5-flash")
+ * makes every chat request fail with 429/503, while Live (which uses its own
+ * model chain) keeps working. These defaults are verified against the
+ * gateway's /v1/models catalog.
+ */
+export const DEFAULT_GATEWAY_MODEL = 'levelup';
+export const DEFAULT_GATEWAY_MODELS: string[] = ['levelup', 'levelup-lite'];
+
+/**
  * Manages provider configs (persisted in state) plus the hidden env default.
  * Secret values are only ever written to storage, never exposed through the
  * returned public views used by the UI.
@@ -127,12 +138,16 @@ export class ProviderSettingsService {
       label: existing?.label ?? 'Default',
       baseUrl,
       apiKey,
-      model: existing?.model ?? envModel ?? 'gemini-2.5-flash',
-      models: existing?.models,
+      // Never invent a raw upstream model name here: the gateway only routes
+      // its own group ids. Env wins, then the verified gateway default group.
+      model: existing?.model ?? envModel ?? DEFAULT_GATEWAY_MODEL,
+      // Picker must never offer a phantom model — when the build ships no
+      // catalog, expose the verified gateway groups instead of nothing.
+      models: existing?.models ?? DEFAULT_GATEWAY_MODELS,
       temperature: existing?.temperature ?? 0.7,
       maxTokens: existing?.maxTokens ?? 4096,
       timeoutMs: existing?.timeoutMs ?? 120_000,
-      retries: existing?.retries ?? 1,
+      retries: existing?.retries ?? 3,
       streaming: existing?.streaming ?? true,
       enabled: true,
       hidden: true,

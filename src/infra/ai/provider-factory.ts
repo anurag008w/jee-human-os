@@ -34,7 +34,7 @@ export function buildHiddenDefaultConfig(env: Record<string, string | undefined>
     temperature: env.VITE_DEFAULT_AI_TEMPERATURE !== undefined ? Number(env.VITE_DEFAULT_AI_TEMPERATURE) : 0.7,
     maxTokens: env.VITE_DEFAULT_AI_MAX_TOKENS !== undefined ? Number(env.VITE_DEFAULT_AI_MAX_TOKENS) : 4096,
     timeoutMs: env.VITE_DEFAULT_AI_TIMEOUT_MS !== undefined ? Number(env.VITE_DEFAULT_AI_TIMEOUT_MS) : 120_000,
-    retries: 1,
+    retries: 3,
     streaming: true,
     enabled: true,
     hidden: true,

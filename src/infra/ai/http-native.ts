@@ -21,7 +21,7 @@ const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
  */
 export class CapacitorHttpClient implements HttpClient {
   async requestJson<T>(init: HttpRequestInit): Promise<T> {
-    const retries = init.retries ?? 1;
+    const retries = init.retries ?? 3;
     let lastError: unknown;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
@@ -63,7 +63,7 @@ export class CapacitorHttpClient implements HttpClient {
         lastError = err;
         if (attempt >= retries) throw lastError;
         const retryable = !(err instanceof HttpError) || RETRYABLE_STATUS.has(err.status);
-        if (retryable) await delayMs(backoffMs(attempt));
+        if (retryable) await delayMs(backoffMs(attempt, err instanceof HttpError ? err.status : undefined));
       }
     }
     throw lastError;
@@ -108,6 +108,11 @@ function statusToKind(status: number): HttpError['kind'] {
   return 'unknown';
 }
 
-function backoffMs(attempt: number): number {
+/**
+ * Backoff between retries. Rate limits (429) get a much longer, capped
+ * backoff — same rationale as the web FetchHttpClient.
+ */
+function backoffMs(attempt: number, status?: number): number {
+  if (status === 429) return Math.min(2000 * Math.pow(2, attempt), 30_000);
   return Math.min(100 * Math.pow(2, attempt), 2000);
 }
