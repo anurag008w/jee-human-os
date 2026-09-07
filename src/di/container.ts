@@ -33,8 +33,9 @@ import { buildRecentProgress, buildJourneyOverview } from '../features/chat/cont
 export interface AppContainer {
   stateRepository: StateRepository;
   /** The app-wide StateStore, plus an explicit storage re-read (N1/N2),
-   *  one-shot memory-prune notice (M7) and immediate persist (N3). */
-  store: StateStore & { reload(): AppState; consumePruneNotice(): string | null; flush(): void };
+   *  one-shot memory-prune notice (M7), immediate persist (N3) and an
+   *  event-driven change subscription (hang-fix P3 — useAppState/ChatScreen). */
+  store: StateStore & { reload(): AppState; consumePruneNotice(): string | null; consumeWriteError(): string | null; flush(): void; subscribe(listener: () => void): () => void };
   clock: Clock;
   http: HttpClient;
   providerSettings: ProviderSettingsService;
@@ -58,6 +59,8 @@ export interface AppContainer {
     export(scope?: BackupScope): string;
     import(json: string): BackupSummary;
   };
+  /** One-shot chat-persist write-failure notice (quota). Consumed by the UI. */
+  consumeChatWriteError(): string | null;
   /** Server-side offline-first backup of user data (state + chat). */
   sync: SyncService;
   /** Debounced push + fresh-install pull orchestration (attach on login). */
@@ -88,15 +91,33 @@ export function createContainer(
   // writes (or a sync restore that ran while hidden) show up in the UI (N2).
   if (typeof window !== 'undefined') {
     const flushStore = () => innerStore.flush();
-    window.addEventListener('pagehide', flushStore);
+    // AUDIT FIX (round 2, MEDIUM): chat persist writes (500ms debounce) had no
+    // GLOBAL flush — only a ChatScreen component effect covered pagehide/hidden,
+    // so an unmount/error-boundary path could orphan the last few messages.
+    // Container-level flush mirrors the state path; the component listener
+    // stays as redundant coverage.
+    const flushChat = () => chat.flush();
+    window.addEventListener('pagehide', () => {
+      flushStore();
+      flushChat();
+    });
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') {
         flushStore();
+        flushChat();
       } else if (document.visibilityState === 'visible') {
         // Flush our own pending debounced write first so the re-read below
         // doesn't clobber a change that hasn't reached localStorage yet.
         flushStore();
-        void reloadPersistentStore().then(() => innerStore.reload());
+        flushChat();
+        void reloadPersistentStore().then(() => {
+          innerStore.reload();
+          // AUDIT FIX (round 1): multi-tab chat writes were never re-read (only
+          // the state store was); a chat typed in another tab stayed invisible.
+          // Same N2 pattern as the state store. reloadFromStorage flushes again
+          // internally — harmless, keeps its own invariant self-contained.
+          chat.reloadFromStorage();
+        });
       }
     });
   }
@@ -159,7 +180,13 @@ export function createContainer(
     { debounceMs: opts.syncDebounceMs },
   );
 
-  const store: StateStore & { reload(): AppState; consumePruneNotice(): string | null; flush(): void } = {
+  const store: StateStore & {
+    reload(): AppState;
+    consumePruneNotice(): string | null;
+    consumeWriteError(): string | null;
+    flush(): void;
+    subscribe(listener: () => void): () => void;
+  } = {
     get: () => innerStore.get(),
     save: (s) => {
       innerStore.save(s);
@@ -167,7 +194,9 @@ export function createContainer(
     },
     reload: () => innerStore.reload(),
     consumePruneNotice: () => innerStore.consumePruneNotice(),
+    consumeWriteError: () => innerStore.consumeWriteError(),
     flush: () => innerStore.flush(),
+    subscribe: (listener) => innerStore.subscribe(listener),
   };
   const providerSettings = new ProviderSettingsService(store, factory);
   const modelCache = new ModelCacheService(factory, store, () => store.save(store.get()));
@@ -226,6 +255,9 @@ export function createContainer(
       rawChatRepo.save(s);
       syncCoordinator.markDirty('chat');
     },
+    // AUDIT FIX (round 2): surface chat persist failures (quota) to the UI —
+    // never silent data loss.
+    consumeWriteError: () => rawChatRepo.consumeWriteError?.() ?? null,
   };
   const chat = new ChatService(
     chatRepo,
@@ -305,15 +337,28 @@ export function createContainer(
 
   const backup = {
     export(scope: BackupScope = 'full'): string {
-      const chat = scope === 'full' ? chatRepo.load() : null;
-      return serializeBackup(buildBackupPayload(store.get(), chat, scope));
+      // AUDIT FIX (round 3): chat writes are debounced ~500ms into ChatService's
+      // in-memory cache, but export reads the PERSISTED repo blob — exporting
+      // inside that window would silently drop the newest turns. Flush first so
+      // the backup contains everything the user can see.
+      if (scope === 'full') chat.flush();
+      const chatBlob = scope === 'full' ? chatRepo.load() : null;
+      return serializeBackup(buildBackupPayload(store.get(), chatBlob, scope));
     },
     import(json: string): BackupSummary {
       const payload = parseBackup(json);
-      return applyBackup(payload, {
+      const result = applyBackup(payload, {
         store,
         chat: { replaceStore: (sessions) => chat.replaceStore(sessions) },
       });
+      // AUDIT FIX (round 2, SEVERE): restore atomicity. applyBackup saves state
+      // through the 400ms-debounced store while chat lands immediately — an app
+      // kill within that window left a HALF-RESTORED backup (chat recovered,
+      // state silently lost). Flush both halves synchronously so a restore is
+      // all-or-nothing on disk.
+      store.flush();
+      chat.flush();
+      return result;
     },
   };
 
@@ -336,6 +381,7 @@ export function createContainer(
     plannerService,
     plannerTools,
     backup,
+    consumeChatWriteError: () => chatRepo.consumeWriteError?.() ?? null,
     sync,
     syncCoordinator,
     websearch,

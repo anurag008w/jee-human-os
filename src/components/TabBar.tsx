@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Brain, BookOpen, CalendarCheck, Check, ChevronRight, Download, LayoutList, LineChart, ListTodo, Menu, MessageCircle, NotebookPen, PenLine, Pin, PinOff, Settings, Trash2, Upload, User, X } from 'lucide-react';
+import { Brain, BookOpen, CalendarCheck, Check, ChevronRight, Download, LayoutList, LineChart, ListTodo, Menu, MessageCircle, NotebookPen, PenLine, Pin, PinOff, Settings, Sparkles, Trash2, Upload, User, X } from 'lucide-react';
 import type { AppState, UserProfile } from '../types';
 import type { MemoryEntry } from '../core/domain/memory';
 import { container } from '../di/container';
@@ -312,7 +312,12 @@ export default function TabBar({ active, state, onChange, update }: TabBarProps)
                         <Icon size={19} strokeWidth={isActive ? 2.6 : 2} />
                       </span>
                       <span className="min-w-0 text-left">
-                        <span className="block truncate font-display text-[15px] font-bold">{label}</span>
+                        <span className="flex items-center gap-1.5">
+                          <span className="block truncate font-display text-[15px] font-bold">{label}</span>
+                          {id === 'chat' && (
+                            <Sparkles size={12} className="shrink-0 text-peak" aria-label="Misa features in development" />
+                          )}
+                        </span>
                         <span className="block truncate text-xs text-muted">{hint}</span>
                       </span>
                       {isActive && <motion.span layoutId="side-nav-dot" className="side-nav-dot" />}

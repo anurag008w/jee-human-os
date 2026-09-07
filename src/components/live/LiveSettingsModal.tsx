@@ -74,6 +74,7 @@ export default function LiveSettingsModal({
 
   const [availableModels, setAvailableModels] = useState<string[]>([
     'gemini-3.1-flash-live-preview',
+    'gemini-2.5-flash-native-audio-latest',
     'gemini-2.5-flash-native-audio-preview-09-2025',
     'gemini-2.5-flash',
     'gemini-2.5-pro',
@@ -381,6 +382,100 @@ export default function LiveSettingsModal({
                   ))}
                 </select>
                 {fetchMsg && <p className="mt-1 text-[10px] text-muted">{fetchMsg}</p>}
+              </div>
+
+              {/* Auto-Fallback Models (user-changeable resilience chain) */}
+              <div className="rounded-2xl border border-border bg-black/20 p-4 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-2 text-[11px] font-bold text-muted">
+                    <Layers size={13} className="text-l" /> Auto-Fallback Models
+                  </span>
+                  <span className="text-[9px] text-muted">Jab selected model unavailable ho</span>
+                </div>
+                <p className="text-[10px] text-muted leading-snug">
+                  Agar <span className="font-mono text-text">Live Model</span> connect na ho paye toh Misa
+                  is list me se next model try karti hai (order me). Apni chain bana sakte ho.
+                </p>
+                <div className="space-y-1.5">
+                  {(currentConfig.fallbackModels?.length
+                    ? currentConfig.fallbackModels
+                    : ['gemini-2.5-flash-native-audio-latest', 'gemini-2.5-flash']
+                  ).map((m, i) => (
+                    <div key={`${m}-${i}`} className="flex items-center gap-1.5">
+                      <span className="w-4 text-center text-[10px] font-bold text-l">{i + 1}.</span>
+                      <select
+                        value={m}
+                        onChange={(e) => {
+                          const next = [...(currentConfig.fallbackModels?.length ? currentConfig.fallbackModels : ['gemini-2.5-flash-native-audio-latest', 'gemini-2.5-flash'])];
+                          next[i] = e.target.value;
+                          setCurrentConfig({ ...currentConfig, fallbackModels: next });
+                        }}
+                        className="flex-1 rounded-lg border border-border bg-bg/80 px-2 py-1.5 text-[10px] font-mono text-text focus:border-l focus:outline-none"
+                      >
+                        {availableModels.map((am) => (
+                          <option key={am} value={am}>
+                            {am}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        title="Remove"
+                        onClick={() => {
+                          const next = [...(currentConfig.fallbackModels?.length ? currentConfig.fallbackModels : [])];
+                          next.splice(i, 1);
+                          setCurrentConfig({ ...currentConfig, fallbackModels: next });
+                        }}
+                        className="rounded-lg bg-white/5 px-2 py-1.5 text-[10px] text-muted hover:text-red-400"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                {!(currentConfig.fallbackModels?.length) && (
+                  <p className="text-[10px] text-l/80">Default chain active. Ek model add karo custom banane ke liye.</p>
+                )}
+                <div className="flex items-center gap-1.5">
+                  {!currentConfig.fallbackModels?.length && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCurrentConfig({
+                          ...currentConfig,
+                          fallbackModels: ['gemini-2.5-flash-native-audio-latest', 'gemini-2.5-flash'],
+                        })
+                      }
+                      className="rounded-lg bg-white/5 px-2 py-1.5 text-[10px] font-bold text-l hover:bg-white/10"
+                    >
+                      + Use default chain
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setCurrentConfig({
+                        ...currentConfig,
+                        fallbackModels: [
+                          ...(currentConfig.fallbackModels?.length ? currentConfig.fallbackModels : []),
+                          availableModels[0] || 'gemini-3.1-flash-live-preview',
+                        ],
+                      })
+                    }
+                    className="rounded-lg bg-white/5 px-2 py-1.5 text-[10px] font-bold text-l hover:bg-white/10"
+                  >
+                    + Add model
+                  </button>
+                  {!!currentConfig.fallbackModels?.length && (
+                    <button
+                      type="button"
+                      onClick={() => setCurrentConfig({ ...currentConfig, fallbackModels: undefined })}
+                      className="rounded-lg bg-white/5 px-2 py-1.5 text-[10px] font-bold text-muted hover:text-white/80"
+                    >
+                      Reset to default
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
 

@@ -99,7 +99,7 @@ function wipeForNewOwner(previousOwner: string | null, nextOwner: string): void 
 }
 
 export default function App() {
-  const { state, today, update, refresh, resetAll, adminUnlocked, unlockAdmin, autoUnlock, lockAdmin, setAdminDay, pruneNotice, dismissPruneNotice } = useAppState();
+  const { state, today, update, refresh, resetAll, adminUnlocked, unlockAdmin, autoUnlock, lockAdmin, setAdminDay, pruneNotice, dismissPruneNotice, storageWriteError, dismissStorageWriteError, chatWriteError, dismissChatWriteError } = useAppState();
   const [tab, setTab] = useState<Tab>('today');
   // Once the user has opened the coach, keep it mounted across tab switches so
   // an in-flight AI stream survives (a fresh chat reply must not die just
@@ -286,6 +286,11 @@ export default function App() {
 
   function handleLogout() {
     container.syncCoordinator.detach();
+    // AUDIT FIX (round 3, MEDIUM): reset the server-auth provider on logout too
+    // (previously only guest mode cleared it). Otherwise hiddenDefault keeps the
+    // logged-out user's gateway URL + API key in memory and services reading
+    // "active provider" between logout and next login could use stale creds.
+    container.providerSettings.disableServerAuth();
     clearSession();
     localStorage.removeItem('levelup:guest');
     setSession(null);
@@ -342,6 +347,46 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-bg text-text">
+      {(chatWriteError || storageWriteError) && (
+        <div
+          role="alert"
+          style={{
+            position: 'fixed',
+            top: 12,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 2001,
+            maxWidth: '92vw',
+            background: 'var(--color-surface, #1e1e2e)',
+            color: 'var(--color-text, #eee)',
+            border: '1px solid rgba(239, 68, 68, 0.55)',
+            borderRadius: 12,
+            padding: '10px 14px',
+            boxShadow: '0 6px 20px rgba(0,0,0,0.35)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            fontSize: 13,
+          }}
+        >
+          <span>{chatWriteError || storageWriteError}</span>
+          <button
+            onClick={chatWriteError ? dismissChatWriteError : dismissStorageWriteError}
+            aria-label="Dismiss"
+            style={{
+              border: 'none',
+              background: 'transparent',
+              color: 'inherit',
+              fontSize: 16,
+              cursor: 'pointer',
+              lineHeight: 1,
+              padding: '2px 4px',
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
       {pruneNotice && (
         <div
           role="status"

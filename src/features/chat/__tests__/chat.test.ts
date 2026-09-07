@@ -353,11 +353,13 @@ describe('ChatService', () => {
     counting.saves = 0;
 
     // One flush = 3 chunks (same growing id) → exactly ONE persist, not three.
+    // (P2: the write is trailing-debounced — flush() lands it on disk once.)
     chat.appendMessages(session.id, [
       { id: 'a1', role: 'assistant', content: 'Hello!', createdAt: '2026-01-01T10:00:00.000Z' },
       { id: 'a1', role: 'assistant', content: 'Hello! How can', createdAt: '2026-01-01T10:00:01.000Z' },
       { id: 'a1', role: 'assistant', content: 'Hello! How can I help?', createdAt: '2026-01-01T10:00:02.000Z' },
     ]);
+    chat.flush();
     expect(counting.saves).toBe(1);
     const got1 = chat.getSession(session.id)!;
     expect(got1.messages).toHaveLength(1);
@@ -365,9 +367,68 @@ describe('ChatService', () => {
     chat.appendMessages(session.id, [
       { id: 'a1', role: 'assistant', content: 'Hello! How can I help today?', createdAt: '2026-01-01T10:00:03.000Z' },
     ]);
+    chat.flush();
     expect(counting.saves).toBe(2);
     expect(chat.getSession(session.id)!.messages[0].content).toBe('Hello! How can I help today?');
     expect(chat.getSession(session.id)!.messages).toHaveLength(1);
+  });
+
+  it('feeds live-call transcript messages into the chat AI context so the agent can continue from the call', async () => {
+    // Regression: live-voice exchanges are persisted via appendMessages into the
+    // same session the user keeps chatting in. The next text reply MUST see them
+    // in order in its prompt history — otherwise Misa (chat) has no idea what was
+    // discussed on the live call ("live waale messages chat waale ko pata nahi").
+    let captured: LLMRequest | null = null;
+    const repo = new MemoryChatRepository();
+    const store = makeStore({
+      providers: { openrouter: { id: 'openrouter', label: 'OpenRouter', model: 'a', enabled: true } },
+      aiEnabled: true,
+    });
+    const provider: LLMProvider = {
+      id: 'openrouter',
+      label: 'OpenRouter',
+      isConfigured: () => true,
+      complete: async (): Promise<LLMResponse> => ({ text: '', model: 'a' }),
+      stream: async (req: LLMRequest): Promise<LLMResponse> => {
+        captured = req;
+        return { text: 'done', model: 'a' };
+      },
+      fetchModels: async (): Promise<ModelInfo[]> => [],
+      healthCheck: async (): Promise<HealthCheckResult> => ({ ok: true, provider: 'openrouter', latencyMs: 1 }),
+    };
+    const factory: ProviderFactory = { create: () => provider } as unknown as ProviderFactory;
+    const settings = new ProviderSettingsService(store, factory);
+    const llm = new LLMService(factory, settings);
+    const chat = new ChatService(repo, llm, settings, () => 'ctx', new FakeClock());
+    const session = chat.createSession();
+
+    // Simulate the live-call transcript sink (handleLiveTranscriptUpdate → appendMessages).
+    chat.appendMessages(session.id, [
+      { id: 'live-1', role: 'user', content: 'aaj mujhe integration nahi samjha', createdAt: '2026-01-01T10:00:00.000Z' },
+      { id: 'live-2', role: 'assistant', content: 'integration me u aur v sath khelte hai...', createdAt: '2026-01-01T10:00:05.000Z' },
+      { id: 'live-3', role: 'user', content: 'ok ab samajh gaya, thanks', createdAt: '2026-01-01T10:00:10.000Z' },
+    ]);
+    chat.flush();
+
+    // User continues in the SAME session after the call.
+    await chat.send(session.id, 'waise aaj jo integration samjha tha wo dobara ek line me batao');
+
+    expect(captured).not.toBeNull();
+    const history = captured!.messages.filter((m) => m.role !== 'system');
+    // live-1 (user) + live-2 (assistant) + live-3 (user) + new text = 4 history turns.
+    const assistantContents = history.filter((m) => m.role === 'assistant').map((m) => String(m.content));
+    // The live-call assistant turn is present in chat context.
+    expect(assistantContents.join('\n')).toContain('integration me u aur v');
+    // The user's live turns and the fresh continuation turn are all visible in order.
+    const all = history.map((m) => String(m.content));
+    const idxLive1 = all.findIndex((c) => c.includes('integration nahi samjha'));
+    const idxLive2 = all.findIndex((c) => c.includes('u aur v'));
+    const idxLive3 = all.findIndex((c) => c.includes('ab samajh gaya'));
+    const idxNew = all.findIndex((c) => c.includes('dobara ek line'));
+    expect(idxLive1).toBeGreaterThanOrEqual(0);
+    expect(idxLive2).toBeGreaterThan(idxLive1);
+    expect(idxLive3).toBeGreaterThan(idxLive2);
+    expect(idxNew).toBeGreaterThan(idxLive3);
   });
 
   it('persists the raw transcript of a finished session into memory on new chat', async () => {

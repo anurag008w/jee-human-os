@@ -14,6 +14,11 @@ export interface StateRepository {
    *  storage quota (M7). Returns and clears it so the UI shows it at most
    *  once per prune. Optional — storage backends that never prune return null. */
   consumePruneNotice?(): string | null;
+  /** One-time notice when the last persist hit a storage WRITE failure (quota,
+   *  private-mode denial, etc.). Returns and clears it so the UI can warn the
+   *  user instead of silently dropping their data on the next restart.
+   *  Optional — backends that can't report write failures return null. */
+  consumeWriteError?(): string | null;
 }
 
 /** Read/write handle with an in-memory copy; preferred by services. */
@@ -52,4 +57,8 @@ export interface KeyValueRepository {
 export interface ChatRepository {
   load(): ChatStoreState;
   save(state: ChatStoreState): void;
+  /** AUDIT FIX (round 2): one-shot notice when the LAST save hit a storage
+   *  write failure (quota). Consumed by the UI so chat data loss is never
+   *  silent. Optional — backends that can't report it return null. */
+  consumeWriteError?(): string | null;
 }

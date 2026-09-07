@@ -23,6 +23,7 @@
 import { z } from 'zod';
 import { cleanImportText } from '../../core/domain/import-utils';
 import type { AppState } from '../../core/domain/state';
+import type { ProviderConfig } from '../../core/domain/llm';
 import { defaultChatPrefs, MAX_MESSAGES_PER_SESSION, MAX_SESSIONS, type ChatMessage, type ChatPreferences, type ChatSession, type ChatStoreState } from '../../core/domain/chat';
 import type { StateStore } from '../../core/ports/repositories';
 import { isPhaseId, type PhaseId } from '../../core/domain/task-bank';
@@ -194,7 +195,33 @@ export function buildBackupPayload(state: AppState, chat: ChatStoreState | null,
     const full = normalizeState(state);
     // The model catalog is an API cache, not user data — re-fetched on demand.
     // Stripping it removes ~75% of the file size for most real backups.
-    data.state = { ...full, aiSettings: { ...full.aiSettings, modelCache: {} } };
+    // AUDIT FIX (round 2, MEDIUM): also strip SECRETS from the export. The
+    // full AppState carries the Gemini/OpenRouter/etc provider keys, the
+    // web-search key and the Live API key. That file is shareable via file
+    // pickers and pushed to the sync gateway — a theft or server-side leak of
+    // it would exfiltrate live billing credentials. Replace each key with a
+    // `has*Key: true` flag so an import can still tell "a key was set" (and
+    // warn the user to re-enter it) without ever shipping the secret itself.
+    const providers: Record<string, ProviderConfig> = {};
+    for (const [id, p] of Object.entries(full.aiSettings.providers ?? {})) {
+      providers[id] = { ...p, apiKey: undefined, customHeaders: undefined };
+    }
+    const websearch = full.aiSettings.websearch
+      ? { ...full.aiSettings.websearch, apiKey: '' }
+      : full.aiSettings.websearch;
+    const live = full.aiSettings.live
+      ? { ...full.aiSettings.live, apiKey: full.aiSettings.live.apiKey ? 'REDACTED_IN_BACKUP' : undefined }
+      : undefined;
+    data.state = {
+      ...full,
+      aiSettings: {
+        ...full.aiSettings,
+        modelCache: {},
+        providers,
+        websearch,
+        live,
+      },
+    };
     if (chat) data.chat = { version: 1, sessions: chat.sessions };
   } else if (scope === 'tasks') {
     const full = normalizeState(state);
@@ -294,9 +321,35 @@ export function applyBackup(payload: BackupPayload, targets: ApplyBackupTargets,
       throw new BackupError('Backup ka state section valid nahi hai.', 'INVALID_STATE');
     }
     const sessions = normalizeChatSessions(payload.data.chat);
-    targets.store.save(state);
+    // AUDIT FIX (round 2): backups are exported with secrets REDACTED, so an
+    // import of one must NOT clobber the CURRENT device's working keys with a
+    // literal "REDACTED_IN_BACKUP" placeholder (which would silently break AI
+    // chat/search/live). Keep the device's existing keys; only overwrite the
+    // non-secret fields. This makes re-import idempotent w.r.t. credentials.
+    const withRedaction = (redact: (s: AppState) => AppState): AppState => {
+      const current = targets.store.get();
+      const merged: AppState = { ...state, aiSettings: { ...state.aiSettings } };
+      const liveBackup = state.aiSettings.live;
+      const liveCurrent = current.aiSettings?.live;
+      const redactedLive = liveBackup && (liveBackup.apiKey === 'REDACTED_IN_BACKUP' || liveBackup.apiKey === 'REDACTED_IN_SYNC');
+      merged.aiSettings.live = redactedLive && liveCurrent
+        ? { ...liveBackup, apiKey: liveCurrent.apiKey }
+        : liveBackup;
+      const safeWeb = state.aiSettings.websearch;
+      if (safeWeb && !safeWeb.apiKey && current.aiSettings?.websearch?.apiKey) {
+        merged.aiSettings.websearch = { ...safeWeb, apiKey: current.aiSettings.websearch.apiKey };
+      }
+      for (const [id, p] of Object.entries(state.aiSettings.providers ?? {})) {
+        if (!p || p.apiKey !== undefined) continue; // only preserve when backup has no key
+        const cur = current.aiSettings?.providers?.[id];
+        if (cur?.apiKey) merged.aiSettings.providers = { ...(merged.aiSettings.providers ?? {}), [id]: { ...p, apiKey: cur.apiKey } };
+      }
+      return redact ? redact(merged) : merged;
+    };
+    const restored = withRedaction((s) => s);
+    targets.store.save(restored);
     targets.chat?.replaceStore(sessions);
-    return summarizeBackup(state, sessions, bytes, scope);
+    return summarizeBackup(restored, sessions, bytes, scope);
   }
 
   // Scoped import: merge only the carried section into the live store.

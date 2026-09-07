@@ -23,6 +23,7 @@ import type { HttpClient } from '../../infra/ai/http';
 import { HttpError } from '../../infra/ai/http';
 import type { AuthSession } from '../../lib/auth';
 import type { AppState } from '../../core/domain/state';
+import type { ProviderConfig } from '../../core/domain/llm';
 import type { ChatStoreState } from '../../core/domain/chat';
 import type { RelationshipState } from '../ai/relationship-state';
 import type { MisaProactiveBlob } from '../ai/proactive-agent.service';
@@ -272,7 +273,29 @@ export function stateSyncPayload(state: AppState): unknown {
   const full = normalizeState(state);
   // The model catalog is an API cache, not user data — re-fetched on demand.
   // Stripping it removes ~75% of the file size for most real backups.
-  return { ...full, aiSettings: { ...full.aiSettings, modelCache: {} } };
+  // AUDIT FIX (round 2, MEDIUM): strip provider/websearch/live SECRETS before
+  // this leaves the device for the sync gateway — same policy as full backup
+  // export. Never push live API keys to a server.
+  const providers: Record<string, ProviderConfig> = {};
+  for (const [id, p] of Object.entries(full.aiSettings.providers ?? {})) {
+    providers[id] = { ...p, apiKey: undefined, customHeaders: undefined };
+  }
+  const websearch = full.aiSettings.websearch
+    ? { ...full.aiSettings.websearch, apiKey: '' }
+    : full.aiSettings.websearch;
+  const live = full.aiSettings.live
+    ? { ...full.aiSettings.live, apiKey: full.aiSettings.live.apiKey ? 'REDACTED_IN_SYNC' : undefined }
+    : undefined;
+  return {
+    ...full,
+    aiSettings: {
+      ...full.aiSettings,
+      modelCache: {},
+      providers,
+      websearch,
+      live,
+    },
+  };
 }
 
 /** Builds the payload pushed for the `chat` scope. */

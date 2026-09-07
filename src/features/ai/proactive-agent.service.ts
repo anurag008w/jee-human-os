@@ -22,6 +22,7 @@ import { validateProactiveDelivery } from './behavior-validator';
 import type { UserActivityState } from '../../core/domain/activity-signal';
 import { isAppActive } from '../../lib/notifications';
 import { container } from '../../di/container';
+import { isLiveCallActive } from './live-call-state';
 import type { LiveCallOrigin } from '../../core/domain/live-types';
 
 export interface ProactivePreferences {
@@ -79,6 +80,8 @@ export interface ScheduledProactiveMessage {
   linkedEntity?: { type: 'todo' | 'task' | 'memory' | 'keyword'; value: string };
   /** Track kaunsi scheduled fired ho chuki — dobara na bhejo. */
   cancelled?: boolean;
+  /** Kitni baar validation-ne-blocked retry ho chuki (cap lagata hai). */
+  deliveryRetries?: number;
 }
 
 /**
@@ -266,6 +269,13 @@ class ProactiveAgentService {
   private pendingTriggers: ProactiveTrigger[] = [];
   private debounceTimer: any = null;
   private sessionIdleTimer: any = null;
+  /** One-shot deferred actions (must be canceled on destroy). */
+  private celebrationTimer: any = null;
+  private chatCallTimer: any = null;
+  private missedCallTimer: any = null;
+  private offlineCallTimer: any = null;
+  /** Re-entrancy guard: true while checkInactivityAndFire holds an LLM await. */
+  private inactivityCheckInFlight = false;
   private lastSessionTopic: string | null = null;
   private isUserCurrentlyInChat = false;
   private currentActivityState: UserActivityState = 'IDLE';
@@ -454,9 +464,31 @@ class ProactiveAgentService {
       clearTimeout(this.platformTimeout);
       this.platformTimeout = null;
     }
+    // F3: also clear the in-flight debounce/idle/follow-up timers on teardown,
+    // not just the platform polls. A stale timer firing into a destroyed
+    // service re-seals sessions, schedules duplicate notifications, or injects
+    // late messages after the user has left — silent ghost activity.
+    if (this.debounceTimer !== null) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    if (this.sessionIdleTimer !== null) {
+      clearTimeout(this.sessionIdleTimer);
+      this.sessionIdleTimer = null;
+    }
+    // One-shot deferred actions (celebration / chat-call / missed-call /
+    // offline-call) — clear so they can't inject into a destroyed service.
+    for (const t of [this.celebrationTimer, this.chatCallTimer, this.missedCallTimer, this.offlineCallTimer]) {
+      if (t !== null) clearTimeout(t);
+    }
+    this.celebrationTimer = null;
+    this.chatCallTimer = null;
+    this.missedCallTimer = null;
+    this.offlineCallTimer = null;
     this.platformActionListener?.();
     this.platformActionListener = null;
     this.platformInitialized = false;
+    this.isUserCurrentlyInChat = false;
   }
 
   private async initPlatformNotifications(): Promise<void> {
@@ -535,6 +567,8 @@ class ProactiveAgentService {
   private checkAndDispatchDueTriggers(): void {
     if (!this.prefs.enabled) return;
     if (this.isQuietTime()) return;
+    // P5 (hang-fix): a live call is open — deliver nothing proactive now.
+    if (isLiveCallActive()) return;
 
     const now = Date.now();
     const due = this.pendingTriggers.filter((t) => t.scheduledTime <= now);
@@ -586,6 +620,8 @@ class ProactiveAgentService {
   private checkScheduledMessages(): void {
     if (!this.prefs.enabled) return;
     if (this.isQuietTime()) return;
+    // P5 (hang-fix): a live call is open — deliver nothing proactive now.
+    if (isLiveCallActive()) return;
 
     const now = Date.now();
     const due = this.scheduledMessages.filter((s) => s.scheduledTime <= now);
@@ -596,7 +632,18 @@ class ProactiveAgentService {
 
     for (const item of due) {
       if (item.kind === 'call') {
-        this.triggerIncomingCall(item.reason || 'Misa ne schedule kiya tha');
+        const fired = this.triggerIncomingCall(item.reason || 'Misa ne schedule kiya tha');
+        if (!fired) {
+          // Suppressed (quiet time / live call / interval / decline penalty):
+          // re-schedule so a booked call isn't silently lost, with a retry cap.
+          const tries = (item.deliveryRetries ?? 0) + 1;
+          if (tries < 3) {
+            this.scheduledMessages.push({ ...item, scheduledTime: now + 5 * 60 * 1000, deliveryRetries: tries });
+            this.saveState();
+          } else {
+            console.warn(`[Proactive] Dropping scheduled call "${item.reason}" after ${tries} blocked retries.`);
+          }
+        }
       } else if (item.text) {
         const relState = relationshipManager.getState();
         const validation = validateProactiveDelivery(
@@ -619,7 +666,29 @@ class ProactiveAgentService {
             now,
           }
         );
-        const msg = validation.valid ? validation.sanitizedText || item.text : item.text;
+        // Respect the SAME behavior guards as nudge triggers (grace period,
+        // DND, fatigue, duplicate). A scheduled reminder must NOT fire during
+        // the 30-min active grace, or the user gets interrupted mid-work.
+        if (!validation.valid) {
+          console.warn(
+            `[Proactive] Skipped scheduled message "${item.topic}" — validation blocked (${validation.reason || 'unknown'}).`,
+          );
+          // Permanent blocks (exact-duplicate, DND-till) must not retry
+          // forever — cap at 3 tries (~15 min) then drop with a warning so
+          // the item can't zombie the sync scope with saveState() churn.
+          const tries = (item.deliveryRetries ?? 0) + 1;
+          if (tries >= 3) {
+            console.warn(`[Proactive] Dropping scheduled message "${item.topic}" after ${tries} blocked retries.`);
+            continue;
+          }
+          // Re-schedule it so it isn't silently lost — it becomes due again
+          // on the next poll once the guard clears.
+          const retry = now + 5 * 60 * 1000;
+          this.scheduledMessages.push({ ...item, scheduledTime: retry, deliveryRetries: tries });
+          this.saveState();
+          continue;
+        }
+        const msg = validation.sanitizedText || item.text;
         this.injectMessageIntoChat(msg);
         relationshipManager.recordProactiveSent(item.topic || 'ai_scheduled', msg);
       }
@@ -671,8 +740,12 @@ class ProactiveAgentService {
       const ent = s.linkedEntity;
       if (!ent) return true;
       if (ent.type !== type) return true;
-      // Fuzzy match — exact ya contains (title mismatch par bhi cancel).
+      // AUDIT FIX (round 1, LOW): keep items whose stored linked value is
+      // EMPTY (legacy/corrupt/sync-merged). Before, `norm.includes('')` was
+      // always true → the predicate short-circuited false, so completing ANY
+      // item of that type silently wiped every value-less scheduled reminder.
       const entNorm = (ent.value || '').trim().toLowerCase();
+      if (entNorm === '') return true;
       return entNorm !== norm && !norm.includes(entNorm) && !entNorm.includes(norm);
     });
     if (this.scheduledMessages.length !== before) {
@@ -729,6 +802,8 @@ class ProactiveAgentService {
   private async checkSpontaneousMemoryMessage(): Promise<void> {
     if (!this.prefs.enabled) return;
     if (this.isQuietTime()) return;
+    // P5 (hang-fix): a live call is open — deliver nothing proactive now.
+    if (isLiveCallActive()) return;
 
     const now = Date.now();
     if (now < this.nextSpontaneousAt) return;
@@ -850,6 +925,10 @@ class ProactiveAgentService {
     }
 
     // LLM se personalized message try karo, fallback offlineMsg/template.
+    // RESERVE the cooldown BEFORE the await: release-on-send was opening a
+    // re-entrancy window (interval + 5s platformTimeout both passing the guard
+    // while this awaited) → duplicate spontaneous messages.
+    this.nextSpontaneousAt = now + ProactiveAgentService.SPONTANEOUS_MIN_GAP_MS;
     const msg = await this.generateDynamicProactiveMessage(situation, sourceLabel).catch(() => offlineMsg);
     const finalMsg = msg?.trim() || offlineMsg;
 
@@ -953,6 +1032,15 @@ Instructions:
   private async checkInactivityAndFire(): Promise<void> {
     if (!this.prefs.enabled) return;
     if (this.isQuietTime()) return;
+    // P5 (hang-fix): a live call is open — deliver nothing proactive now.
+    if (isLiveCallActive()) return;
+    // Re-entrancy guard: the LLM call below runs UNRESERVED. Two overlapping
+    // invocations (2-min interval + 5s platformTimeout) could both pass the
+    // inactivity threshold before either commits → duplicate messages. Reserve
+    // the check for the whole in-flight span.
+    if (this.inactivityCheckInFlight) return;
+    this.inactivityCheckInFlight = true;
+    try {
 
     const now = Date.now();
     const effectiveLastActive = Math.max(this.lastUserChatTimestamp || 0, this.lastActiveTimestamp || 0);
@@ -1003,6 +1091,10 @@ Instructions:
           this.lastUserChatTimestamp = now;
           return;
         }
+        // Blocked daytime nudge (grace/DND/fatigue) must NOT fall through to a
+        // spontaneous CALL in the same tick — the validator just said "speak
+        // now", so calling is even worse. Back off and re-evaluate later.
+        return;
       }
     }
 
@@ -1016,8 +1108,15 @@ Instructions:
       if (validation.valid) {
         this.injectMessageIntoChat(validation.sanitizedText || msg);
         relationshipManager.recordProactiveSent('inactivity_96h', msg);
-        this.lastUserChatTimestamp = now - 48 * 3600 * 1000;
+        // AUDIT FIX (round 1, SEVERE): this used to be `now - 48h`, so the very
+        // next poll (2 min later) re-entered the 48h branch and spammed a second
+        // check-in right after the 4-day reset. Anchor to now like every other tier.
+        this.lastUserChatTimestamp = now;
       }
+      // AUDIT FIX: never fall through to a spontaneous CALL in the same tick a
+      // nudge was sent (or just blocked by the validator) — same rule as the
+      // daytime branch above.
+      return;
     } else if (effectiveLastActive > 0 && inactiveSince >= 48 * 3600 * 1000) {
       const msg = await this.generateDynamicProactiveMessage('Student has been quiet for 2 days. Send a friendly, low-pressure check-in.', 'inactivity_48h');
       const validation = validateProactiveDelivery(
@@ -1030,6 +1129,7 @@ Instructions:
         relationshipManager.recordProactiveSent('inactivity_48h', msg);
         this.lastUserChatTimestamp = now;
       }
+      return;
     } else if (effectiveLastActive > 0 && inactiveSince >= 24 * 3600 * 1000) {
       const msg = await this.generateDynamicProactiveMessage('Student has been away for 24 hours. Encourage starting with 1 small study target today.', 'inactivity_24h');
       const validation = validateProactiveDelivery(
@@ -1042,10 +1142,14 @@ Instructions:
         relationshipManager.recordProactiveSent('inactivity_24h', msg);
         this.lastUserChatTimestamp = now;
       }
+      return;
     }
 
     // ── Spontaneous Call Decision (Requirement 8) ────────────────────────────
     this.evaluateSpontaneousCall(now, relState);
+    } finally {
+      this.inactivityCheckInFlight = false;
+    }
   }
 
   private evaluateSpontaneousCall(now: number, relState: any): void {
@@ -1179,7 +1283,12 @@ Instructions:
       }
 
       const celebMsg = pickVariedTemplate('celebration', relationshipManager.getState().recentSentMessages);
-      setTimeout(() => {
+      // AUDIT FIX (round 1, LOW): clear any pending celebration before
+      // scheduling a new one — two completions inside the delay window used to
+      // spawn two timers and inject duplicate celebration messages.
+      if (this.celebrationTimer !== null) clearTimeout(this.celebrationTimer);
+      this.celebrationTimer = setTimeout(() => {
+        this.celebrationTimer = null;
         this.injectMessageIntoChat(celebMsg);
       }, 800);
     }
@@ -1221,7 +1330,8 @@ Instructions:
       lowerUser.includes('call karna') ||
       lowerUser.includes('mujhe call')
     ) {
-      setTimeout(() => {
+      this.chatCallTimer = setTimeout(() => {
+        this.chatCallTimer = null;
         this.triggerIncomingCall('User ne chat me call karne ko kaha', 'user_tool');
       }, 1800);
       return;
@@ -1331,8 +1441,11 @@ Instructions:
     this.lastSessionTopic = topicForFollowUp || this.lastSessionTopic;
 
     this.sessionIdleTimer = setTimeout(() => {
-      this.isUserCurrentlyInChat = false;
+      // Evaluate the 5-min follow-up while STILL flagged as "in active session"
+      // so the grace-shield doesn't reject it (the follow-up is the designed
+      // next touchpoint, not an interruption). Mark idle only after evaluating.
       this.evaluateSessionFollowUp();
+      this.isUserCurrentlyInChat = false;
     }, 5 * 60 * 1000);
   }
 
@@ -1598,19 +1711,22 @@ Instructions:
     }
   }
 
-  triggerIncomingCall(reason = 'Study check-in', origin: LiveCallOrigin = 'auto'): void {
-    if (!this.prefs.callsEnabled) return;
-    if (this.isQuietTime()) return;
+  triggerIncomingCall(reason = 'Study check-in', origin: LiveCallOrigin = 'auto'): boolean {
+    if (!this.prefs.callsEnabled) return false;
+    if (this.isQuietTime()) return false;
+    // P5 (hang-fix): never fire a second incoming-call while a live call is
+    // already active — the overlay is open and a duplicate modal is jarring.
+    if (isLiveCallActive()) return false;
 
     const now = Date.now();
     const minCallInterval = this.prefs.callFrequency === 'rare' ? 4 * 24 * 3600 * 1000 : 2 * 24 * 3600 * 1000;
     const declinePenaltyMs = (3 + this.consecutiveCallDeclines) * 24 * 3600 * 1000;
 
     if (now - this.lastCallDeclinedTimestamp < declinePenaltyMs && !reason.includes('User ne')) {
-      return;
+      return false;
     }
     if (now - this.lastCallTimestamp < minCallInterval && !reason.includes('User ne')) {
-      return;
+      return false;
     }
 
     this.lastCallTimestamp = now;
@@ -1626,6 +1742,7 @@ Instructions:
     for (const listener of this.incomingCallListeners) {
       listener(callEvent);
     }
+    return true;
   }
 
   onCallAccepted(_callId: string): void {
@@ -1648,7 +1765,11 @@ Instructions:
     this.saveState();
     this.injectCallStatusEvent('missed');
     // Turant nahi — human-like: thoda wait karke natural chalke bolo.
-    setTimeout(() => {
+    // AUDIT FIX (round 2, LOW): clear a previous pending timer first — two
+    // missed calls inside 90s used to double-nudge.
+    if (this.missedCallTimer !== null) clearTimeout(this.missedCallTimer);
+    this.missedCallTimer = setTimeout(() => {
+      this.missedCallTimer = null;
       this.injectMessageIntoChat('Hii, suno? Padh rahe the kya? Free hoke text karna!');
     }, 90 * 1000);
   }
@@ -1660,7 +1781,10 @@ Instructions:
     this.recordMissedInteraction('call', `Offline tha — ${reason} ke liye call nahi ho sakti thi`);
     this.saveState();
     this.injectCallStatusEvent('offline_attempt');
-    setTimeout(() => {
+    // AUDIT FIX (round 2, LOW): same single-timer invariant as missed-call.
+    if (this.offlineCallTimer !== null) clearTimeout(this.offlineCallTimer);
+    this.offlineCallTimer = setTimeout(() => {
+      this.offlineCallTimer = null;
       this.injectMessageIntoChat(`Hii, ${reason} ke liye call plan ki thi par network unreachable tha. Jab online aao toh batana! 📶`);
     }, 1000);
   }
@@ -1701,6 +1825,8 @@ Instructions:
   private checkMissedInteractionFollowUp(): void {
     if (!this.prefs.enabled) return;
     if (this.isQuietTime()) return;
+    // P5 (hang-fix): a live call is open — deliver nothing proactive now.
+    if (isLiveCallActive()) return;
 
     const now = Date.now();
     const pending = this.missedInteractions.find((m) => m.followedUpAt === null);
@@ -1730,6 +1856,10 @@ Instructions:
   }
 
   injectMessageIntoChat(text: string): void {
+    // P5 hard gate: a live call is open — no proactive bubble may land in the
+    // chat (this is also the check for delayed callers that bypass the polling
+    // guards: onTaskCompleted, evaluateSessionFollowUp, onCallMissed timers).
+    if (isLiveCallActive()) return;
     // Dedupe window — same text ek hi baar chat me inject hota hai. Polling
     // loop + notification tap listener dono same offlineMessage inject kar
     // sakte hain (duplicate 3x bug ka fix). Sirf exact-same text skip hota

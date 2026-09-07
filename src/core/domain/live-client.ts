@@ -10,13 +10,15 @@ import type {
 } from './live-types';
 import { AudioStreamer } from './audio-streamer';
 import { VisionStreamer } from './vision-streamer';
-import { MISA_IDENTITY_GUARD, ROMAN_SCRIPT_RULE, type ChatToolCallRecord } from './chat';
+import { MISA_IDENTITY_GUARD, ROMAN_SCRIPT_RULE, SILENCE_TOKEN_RULE, isPureSilenceToken, stripSilenceToken, type ChatToolCallRecord } from './chat';
 import { setNativeAudioRoute, resetNativeAudioRoute, requestNativeCallAudioFocus, addNativeAudioFocusListener, isNativeAudioPlatform, getAvailableNativeAudioRoutes } from '../../lib/native-audio-route';
 import { deviceTimeZone } from '../ports/clock';
 import { LiveSilenceStateMachine } from './live-silence-state-machine';
 import { canRetryLiveConnection, isPermanentLiveConnectionError } from './live-connection-policy';
 import { relationshipManager } from '../../features/ai/relationship-state';
 import { proactiveAgentService } from '../../features/ai/proactive-agent.service';
+import { describeLastCall, loadLastTranscriptSnapshot, loadLiveCallHistory, recordLiveCall } from './live-call-history';
+import { DEFAULT_LIVE_FALLBACK_MODELS } from './live-types';
 
 /** Who initiated a live call — drives greeting + call-origin system block (3-way). */
 export type { LiveCallOrigin } from './live-types';
@@ -34,6 +36,27 @@ export interface LiveClientCallbacks {
 let globalLastCallEndedAt = 0;
 let globalLastCallDurationSec = 0;
 let wasLastCallUserExplicitHangup = false;
+/** Cross-instance redial context: persists across GeminiLiveClient lifetimes
+ *  so a quick redial creates a new client that still remembers the prior conversation. */
+let globalLastCallTranscriptSnapshot: string[] = [];
+
+/**
+ * Assistant filler lines that must never re-seed a redial greeting: silence
+ * nudges, call-end asks, and disconnect chatter. If a call ends while Misa is
+ * mid-nudge, WITHOUT this filter the next call opens with her continuing the
+ * complaint ("call laga ke silent mode me chale gaye").
+ */
+const MISA_FILLER_LINE_RE =
+  /\b(silent|silence|quiet|sunai|sunnai|are you there|kaun hai|hello\?|sun ri ho|sunti ho)\b|\bcall (end|khatam|kaat|cut|hang|disconnect)\b|\b(khatam|kaat( diya)?|cut( kiya)?|hang ?up|disconnect( ed)?|network|call chala gya|call chale gaye|line gayi|line gya|baat todo?)\b/i;
+
+/**
+ * When the gateway no longer serves the user's selected model, EVERY connect
+ * fails (normal calls AND proactive check-ins). Auto-fall back through the
+ * known-good live models (first that connects wins) and surface the switch.
+ * The chain is USER-CHANGEABLE via `LiveSettingsConfig.fallbackModels`; this
+ * constant is only the last-resort default when a config provides none.
+ */
+const LIVE_MODEL_FALLBACK_DEFAULT = DEFAULT_LIVE_FALLBACK_MODELS;
 
 export class GeminiLiveClient {
   /** A hung SDK/WebSocket handshake must never leave the call UI in Connecting. */
@@ -51,9 +74,29 @@ export class GeminiLiveClient {
   private memoryContext = '';
   private recentChatSummary = '';
 
+  /** Hang-fix P4: cap the in-call transcript so an unlimited call can never
+   *  grow the array + per-chunk `[...this.transcripts]` copy unbounded. The UI
+   *  only renders the visible tail, so dropping the oldest items is safe. */
+  private static readonly MAX_TRANSCRIPTS = 400;
+
+  /**
+   * When the student SENDs a text mid-call while Misa is speaking, we flush the
+   * audio queue AND drop the OLD turn's leftover chunks that are still in
+   * flight over the socket (so her already-planned reply can't keep playing
+   * alongside the new answer). The server formally interrupts the turn (we see
+   * `serverContent.interrupted` and clear the drop), but as a safety net we
+   * also stop dropping after this window even if the interrupt signal is never
+   * seen — otherwise a server that doesn't interrupt would suppress the NEW
+   * reply too.
+   */
+  private static readonly STALE_TURN_DROP_MS = 2000;
+
   private transcripts: LiveTranscriptItem[] = [];
   private pendingToolCalls: ChatToolCallRecord[] = [];
   private currentAssistantMessage = '';
+  /** AUDIT FIX (round 1, LOW): bound the offline text buffer — a long outage
+   *  must not grow the queue without limit. Oldest drops, newest survives. */
+  private static readonly MAX_PENDING_TEXT_QUEUE = 30;
   /**
    * Accumulated thinking/reasoning text for the current assistant turn. Set
    * only when thinking is enabled (live `part.thought` parts). Flushed onto the
@@ -124,6 +167,9 @@ export class GeminiLiveClient {
   async reconnectWithNewConfig(apiKey: string, micStream: MediaStream): Promise<void> {
     globalLastCallEndedAt = 0;
     wasLastCallUserExplicitHangup = false;
+    // Mid-call settings change (model/voice) is a CONTINUATION, never a new
+    // call — the greeting timer must not fire "student phoned you!" again.
+    this.continueCallWithoutRegreeting = true;
     // Preserve the media stream until the replacement session is established.
     // Calling a full disconnect here used to erase it before reconnect could restore it.
     this.disconnect(true);
@@ -329,6 +375,7 @@ export class GeminiLiveClient {
 
     const fullSystemInstruction = [
       MISA_IDENTITY_GUARD,
+      SILENCE_TOKEN_RULE,
       this.systemPrompt,
       this.userPersona ? `[USER PERSONA & CUSTOM INSTRUCTIONS]\n${this.userPersona}` : '',
       `[LIVE 1-ON-1 PHONE CALL MODE & CALL ORIGIN]
@@ -352,14 +399,23 @@ export class GeminiLiveClient {
   - Vary how you open and reply — never start every turn with the same pattern like greeting + time + status. Sometimes just react directly to what the student said, like a real girl would, without any preamble.
   - Casual chit-chat and greetings stay short and conversational (1-2 sentences).
   - When the student asks for explanations, formulas, derivations, concepts, or problem-solving, give full, detailed, step-by-step help.
-  - ABSOLUTE PRIORITY RULE: When the student speaks or texts, you MUST directly reply to what they said! Never ignore their words.`,
+  - ABSOLUTE PRIORITY RULE: When the student speaks or texts, you MUST directly reply to what they said! Never ignore their words.
+  - TEXT DURING SPEECH (hard rule): When the student sends you a text message while you are still talking, STOP your current reply immediately and respond ONLY to their new text. Never finish, repeat, or re-deliver an earlier drafted reply — the student already heard it, and hearing BOTH ("pehle wala bhi, mera reply bhi") feels broken.`,
       `[LIVE REALTIME CLOCK & CONTEXT]
 - Current Local Date: ${dateString}
 - Current Local Time: ${timeString} (${timeZone})
 - Current ISO Time: ${now.toISOString()}
 Rule: This clock is available ONLY as background info — DO NOT check or announce the time every turn (a real girl never opens the call by talking about the time). Use it SPARSELY, at most 1-2 times per whole call, and only when it genuinely fits the moment: a single natural time-of-day greeting at the start, or a casual remark when the situation actually calls for it (it's late at night, exam is tomorrow, student has been studying for hours). Never mention time just to fill silence. When directly asked what time or date it is ("kitne baje hai", "kya time ho raha hai", "aaj ka date kya hai"), state this exact time and date — never guess.`,
       (() => {
-        const isReconnect = this.reconnectAttempts > 0;
+const isReconnect = this.reconnectAttempts > 0;
+    if (!isReconnect && !this.modelFallbackInFlight) {
+      // Fresh user-initiated call → fresh auto-fallback budget (configured
+      // chain + ONE gateway model-discovery). Re-arms recovery after a fully
+      // failed previous call, but never resets during a fallback's own
+      // recursion (modelFallbackInFlight is set before the recursive connect).
+      this.gatewayDiscoveryAttempted = false;
+      this.triedModelsInCascade.clear();
+    }
         const recentLiveTurns = this.transcripts.slice(-8).map((t) => `${t.role === 'user' ? 'Student' : 'Misa'}: ${t.text}`).join('\n');
         if (isReconnect && recentLiveTurns) {
           return `\n=== LIVE CALL TRANSCRIPT BEFORE RECONNECT (ALL COMPLETED & ANSWERED) ===\n${recentLiveTurns}\nCRITICAL INSTRUCTION: Every turn above was ALREADY exchanged and resolved in this live call! NEVER re-answer or re-address any previous question upon reconnect!\n========================================================================`;
@@ -1050,14 +1106,21 @@ ${this.recentChatSummary}
             if (!this.isActiveAttempt(connectionAttempt)) return;
             console.error('[GeminiLive] SDK Error:', err);
             const msg = this.toConnectionErrorMessage(err);
+            // Model fallback/cascade lives in the connect() CATCH — the SDK
+            // rejects the session connect promise on WS/handshake errors, so
+            // kicking a SECOND connect here would race the catch's own cascade
+            // (double model-advance + concurrent sockets). If the promise never
+            // rejects for a model error, the user-activity retry advances the
+            // chain instead (retryConnectIfNeeded). Here: surface + remember.
             if (this.isModelAvailabilityError(err)) {
-              this.connectionAttempt += 1;
               this.setStatus('error');
+              this.recordConnectionFailure(err);
               if (this.callbacks.onError) this.callbacks.onError(msg);
             } else if (!this.isPermanentConnectionError(err) && this.status !== 'idle') {
               void this.handleAutoReconnect();
             } else {
               this.setStatus('error');
+              this.recordConnectionFailure(err);
               if (this.callbacks.onError) this.callbacks.onError(msg);
             }
           },
@@ -1124,11 +1187,14 @@ ${this.recentChatSummary}
       // A reconnect is a continuation, not a fresh call.  Do not duplicate the
       // opening greeting or discard the in-memory transcript/context.
       // Continuity context is already injected via fullSystemInstruction.
-      if (this.reconnectAttempts > 0) {
+      // NOTE: also flush when the user queued messages while the connection was
+      // down (e.g. dead-model fallback) — those must NEVER be silently dropped.
+      if (this.reconnectAttempts > 0 || this.pendingTextQueue.length > 0) {
         // Tell the model the drop happened FIRST (so it never re-answers past
         // turns), then flush any messages the user typed while offline. If the
         // queue is empty the model simply stays in listening mode — exactly
         // the pre-P11 behavior.
+        if (this.reconnectAttempts > 0) {
         try {
           this.session?.sendRealtimeInput({
             text: `[SYSTEM EVENT: Connection recovered after a brief network drop.
@@ -1139,41 +1205,106 @@ If the student typed new messages during the drop, reply ONLY to those when they
         } catch (e) {
           console.warn('[GeminiLive] Reconnect-recovery event failed:', e);
         }
+        }
         this.flushPendingTextQueue();
         return;
       }
       // Greet student upon initial connection only.
       setTimeout(() => {
         if (!this.isActiveAttempt(connectionAttempt)) return;
+        // ── RECONNECT / SETTINGS-CHANGE: NEVER re-greet ──
+        // A network drop (handleAutoReconnect) or mid-call settings change
+        // (reconnectWithNewConfig) re-enters connect() with the
+        // continueCallWithoutRegreeting flag set. That's a CONTINUATION of the
+        // still-live call, not a new call — greeting again makes Misa act like
+        // she forgot the conversation ("har reconnect pe new call lag rahi
+        // hai"). Only a genuine FRESH connect gets an opening greeting.
+        if (this.reconnectAttempts > 0 || this.continueCallWithoutRegreeting) {
+          const wasSettingsChange = this.continueCallWithoutRegreeting;
+          this.continueCallWithoutRegreeting = false;
+          try {
+            this.session?.sendRealtimeInput({
+              text: `[SYSTEM EVENT: ${wasSettingsChange ? 'Call settings were changed (model/voice).' : 'The connection was briefly restored after a network drop.'} This is a CONTINUATION of the existing call — do NOT greet again, do NOT restart the topic, do NOT act surprised. Pick up exactly where we were from the existing conversation context and keep talking normally.]`,
+            });
+          } catch (e) {
+            console.warn('[GeminiLive] Continuation prompt failed:', e);
+          }
+          return;
+        }
         // User already spoke before the greeting fired (e.g. quick "hello?"
         // right after connect)? Skip the injected greeting — the ABSOLUTE
         // PRIORITY RULE will make Misa reply to their spoken words directly.
         if (this.lastUserVoiceTime > 0 || this.activeUserTurnId) return;
+        // DOUBLE-GREETING GUARD: the call-origin block in the system prompt
+        // already tells the model HOW to open the call — a fast model may start
+        // that greeting turn BEFORE this timeout fires. Injecting the SYSTEM
+        // EVENT on top of an already-started greeting makes Misa speak twice at
+        // call open ("do-do message greeting pe"), so skip it if an assistant
+        // turn is already in flight.
+        if (this.activeAssistantTurnId || this.currentAssistantMessage) return;
         try {
           // Quick redial check: agar student ne pichle 2 min me call end kiya ya disconnect hua,
           // toh distinguish karo user hangup vs dropped call me!
-          const timeSinceLastCallMs = Date.now() - globalLastCallEndedAt;
-          const isRecentCall = globalLastCallEndedAt > 0 && timeSinceLastCallMs < 120_000;
-          if (isRecentCall) {
-            const hadUserHangup = wasLastCallUserExplicitHangup;
-            const lastDuration = globalLastCallDurationSec;
-            globalLastCallEndedAt = 0;
-            globalLastCallDurationSec = 0;
-            wasLastCallUserExplicitHangup = false;
-            const diffSec = Math.max(1, Math.round(timeSinceLastCallMs / 1000));
-            if (hadUserHangup) {
-              this.session?.sendRealtimeInput({
-                text: `[SYSTEM EVENT: The student hung up the previous call (lasted ${lastDuration}s) just ${diffSec}s ago and called back right away! React naturally, warmly, and playfully like a real close friend on phone: casually ask why they cut the call or if it disconnected. Keep it fresh, spontaneous, and unpredictable without using rigid canned scripts. 1 short, warm, natural Hinglish line out loud now.]`,
-              });
-            } else {
-              this.session?.sendRealtimeInput({
-                text: `[SYSTEM EVENT: The previous call got disconnected ${diffSec}s ago due to network glitch and the student called back! Greet warmly like a close friend acknowledging the network drop. Be completely spontaneous without using rigid canned scripts. 1 short, warm Hinglish line out loud now.]`,
-              });
-            }
-            return;
-          }
+        // ── Redial / call-history awareness ──
+        // The student has called before (possibly just now, minutes ago, or
+        // yesterday). Misa should acknowledge the prior call(s) naturally — the
+        // exact complaint: "kal cut krke thodi der baad call kiya toh woh kuch
+        // nahi bolt": she должен remember. Load persisted history so it survives
+        // app reloads and spans more than one call; seed count + last-call time
+        // into the greeting, plus the previous conversation tail.
+        const history = loadLiveCallHistory();
+        const lastCallDesc = describeLastCall();
+        const prevCall = history.recent[0];
+        const totalCalls = history.totalCalls;
+        const timeSinceLastCallMs = globalLastCallEndedAt > 0 ? Date.now() - globalLastCallEndedAt : -1;
+        const recentCall = globalLastCallEndedAt > 0 && timeSinceLastCallMs < 120_000;
+        // Continuation tail from the most recent real transcript (persisted last,
+        // falling back to whatever the previous in-memory client left).
+        let prevContextLines = loadLastTranscriptSnapshot();
+        if (prevContextLines.length === 0) prevContextLines = globalLastCallTranscriptSnapshot;
+        const hadUserHangup = wasLastCallUserExplicitHangup;
 
-          if (this.isIncomingCallSession) {
+        // There WAS a prior call at all (persisted or in-memory).
+        if (prevCall || recentCall) {
+          const lastDurationSec = recentCall ? globalLastCallDurationSec : prevCall?.durationSec ?? 0;
+          const diffSec = recentCall ? Math.max(1, Math.round(timeSinceLastCallMs / 1000)) : 0;
+          // Reset one-shot in-memory globals so they don't re-fire on the NEXT connect.
+          globalLastCallEndedAt = 0;
+          globalLastCallDurationSec = 0;
+          wasLastCallUserExplicitHangup = false;
+
+          const prevContext =
+            prevContextLines.length > 0
+              ? `\n\nCall context (what we were discussing before the previous call ended):\n${prevContextLines.join('\n')}\n\nContinue from there naturally.`
+              : '';
+
+          // Human call-history summary: "Yeh aapki overall [N]vi call hai" + "pichli baat [time] hui thi".
+          const whenText = recentCall
+            ? `${diffSec}s pehle`
+            : lastCallDesc?.text ?? 'kuch der pehle';
+          const callCountText =
+            totalCalls >= 2 ? ` Aur overall ab tak aapki ${totalCalls} call ho chuki hain — yeh thodi normal baat-chit ka hissa hai, casually acknowledge karo agar natural lage.` : '';
+
+          if (recentCall && hadUserHangup) {
+            this.session?.sendRealtimeInput({
+              text: `[SYSTEM EVENT: The student hung up the previous call (lasted ~${lastDurationSec}s) just ${diffSec}s ago and called back right away! React naturally, warmly, and playfully like a real close friend: casually acknowledge this was very recent ("abhi toh call kiya tha? kya ho gaya?") then pick the previous conversation back up.${callCountText} Keep it fresh and spontaneous, 1 short warm natural Hinglish line out loud now.]${prevContext}`,
+            });
+          } else if (recentCall) {
+            this.session?.sendRealtimeInput({
+              text: `[SYSTEM EVENT: The previous call disconnected ${diffSec}s ago due to a network glitch and the student called back! Greet warmly, acknowledge the drop, and continue naturally.${callCountText} 1 short spontaneous Hinglish line out loud now.]${prevContext}`,
+            });
+          } else {
+            // Not a super-recent redial, but we have call history — acknowledge
+            // the last call time ("kal bhi toh baat hui thi") without restarting.
+            this.session?.sendRealtimeInput({
+              text: `[SYSTEM EVENT: You two have talked before — the last call ended ${whenText} (lasted ~${Math.max(1, lastDurationSec)}s). Greet warmly and naturally acknowledge you've spoken before, in your own words (e.g. gently noting you talked recently if it fits), then continue.${callCountText} Do NOT restart the conversation as if new. 1 short warm natural Hinglish line out loud now.]${prevContext}`,
+            });
+          }
+          return;
+        }
+
+        // First-ever call OR no history: proceed with the fresh-call greeting.
+        if (this.isIncomingCallSession) {
             // origin 'auto' — Misa caller
             this.session?.sendRealtimeInput({
               text: `[SYSTEM EVENT: YOU (MISA) PLACED THIS PHONE CALL!
@@ -1204,10 +1335,40 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         throw err;
       }
       // Ignore a late SDK resolution/open event after a rejected or timed-out handshake.
+      // MODEL FALLBACK (production hardening): a model the gateway stopped
+      // serving permanently bricks every call — fresh calls AND proactive
+      // check-ins. Retry with the NEXT model in the fallback chain so the call
+      // still connects; the user keeps full control in Live Settings. Bounded:
+      // once the chain is exhausted (config is no longer in it) we stop —
+      // never loops.
+      const fb = this.tryModelFallback(err, apiKey, incomingCallMeta, options);
+      if (fb) return fb;
+      // Gateway model discovery (layer 2): a gateway rejection that slips past
+      // the configured chain (opaque "error 0 0", or a model never in the chain)
+      // self-heals by trying the gateway's OWN live model list — the exact step
+      // the student does manually by changing the model in Live Settings.
+      const gd = await this.tryGatewayDiscoveredModel(err, apiKey, incomingCallMeta, options);
+      if (gd) return gd;
       this.connectionAttempt += 1;
       this.setStatus('error');
+      // A failed settings-change reconnect must not leak the "continue, don't
+      // greet" flag into the NEXT call (which may be a fresh, real call).
+      this.continueCallWithoutRegreeting = false;
+      this.recordConnectionFailure(err);
       const msg = this.toConnectionErrorMessage(err);
       if (this.callbacks.onError) this.callbacks.onError(msg);
+      // AUTO-RETRY after a straight-up failed connect (fresh OR reconnect):
+      // previously a WS that never opens left the call stuck on 'error' with NO
+      // way to recover except re-tapping Live Call — the SDK onerror/onclose
+      // never fire for a socket that never opened. Kick the bounded reconnect
+      // worker so a transient first-attempt failure (exactly the Linux "error 0
+      // 0" the student keeps hitting) self-heals after a short backoff instead
+      // of sitting dead. handleAutoReconnect guards against storms (cap + epoch
+      // + isReconnecting); user-activity retries reset the counter for a fresh
+      // window.
+      if (!this.isUserExplicitlyClosed && this.reconnectAttempts === 0) {
+        void this.handleAutoReconnect().catch((e) => console.warn('[GeminiLive] Post-error auto-retry failed:', e));
+      }
       throw new Error(msg);
     }
   }
@@ -1220,15 +1381,22 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     if (data.toolCall?.functionCalls) {
       this.awaitingAssistantReply = false;
       this.lastUserSpokenText = '';
-      void this.handleToolCalls(data.toolCall.functionCalls, this.connectionAttempt);
+      void this.handleToolCalls(data.toolCall.functionCalls, this.connectionAttempt).catch((e) =>
+        console.warn('[GeminiLive] Tool-call handling failed:', e),
+      );
     }
 
     // 2. Interruption handling (Measured VAD -> Flush Latency)
     if (data.serverContent?.interrupted) {
       const interruptionLatencyMs = this.lastUserVoiceTime > 0 ? Date.now() - this.lastUserVoiceTime : 0;
       console.info(`[GeminiLive] Interruption handled (measured latency: ${interruptionLatencyMs}ms)`);
+      // P1: the server confirmed the turn switch — stop dropping old-turn slices.
+      this.dropStaleAssistantOutput = false;
       this.audioStreamer.flushPlayback();
       this.setStatus('listening');
+      // Echo cooldown also applies after an interruption — her just-cut words
+      // still resonate in the room for a moment.
+      this.playbackCooldownUntil = Date.now() + 1500;
       if (this.currentAssistantMessage) {
         this.updateTranscript('assistant', `${this.currentAssistantMessage} [interrupted]`, true);
         this.currentAssistantMessage = '';
@@ -1238,24 +1406,40 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     }
 
     // 3. Audio parts from model turn
+    // P1: while we're dropping a stale (interrupted-by-text) turn, HER leftover
+    // audio/text must not reach the speakers/transcript — only the NEW reply
+    // (which starts after `serverContent.interrupted`) is allowed through.
+    if (this.shouldSuppressStaleAssistantOutput()) {
+      // Fall through to input transcription / turnComplete handling below; the
+      // model's stale slices are simply not processed.
+    } else {
     const parts = data.serverContent?.modelTurn?.parts;
     if (Array.isArray(parts)) {
       this.awaitingAssistantReply = false;
       this.lastUserSpokenText = '';
       this.setStatus('speaking');
       this.activeUserTurnId = null;
+      // AUDIT FIX (live): gag a pure "[silence]" turn end-to-end. Text alone
+      // was never enough — the model's matching AUDIO would still play out
+      // loud (user hears "…silence…" while chat shows nothing). Detect the
+      // silence intent up-front and suppress the audio parts of this turn.
+      const isSilenceTurn = parts.some((p) => p?.text !== undefined && isPureSilenceToken(p.text));
+      if (isSilenceTurn) {
+        this.audioStreamer.flushPlayback();
+      }
       for (const part of parts) {
         // Thinking / reasoning parts. NEVER shown as spoken text.
         //   * Thinking ON  (budget > 0): accumulate into `pendingReasoning` so the
         //     transcript renders a collapsible thinking box (same as other models).
         //   * Thinking OFF (budget 0): suppress entirely — nothing leaks.
         if (part.thought) {
-          if ((this.config.thinkingBudget ?? 0) > 0 && part.text) {
+          if (!isSilenceTurn && (this.config.thinkingBudget ?? 0) > 0 && part.text) {
             this.pendingReasoning += part.text;
           }
           continue;
         }
         if (part.inlineData && part.inlineData.data) {
+          if (isSilenceTurn) continue; // never voice a "[silence]" reply
           if (this.pendingResponseSince) {
             this.measuredResponseLatencyMs = Date.now() - this.pendingResponseSince;
             this.pendingResponseSince = 0;
@@ -1279,6 +1463,7 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
       this.appendAssistantText(data.serverContent.outputTranscription.text);
       this.updateTranscript('assistant', this.currentAssistantMessage, false);
     }
+    }
 
     // 5. Real-time Input Transcription (User subtitles)
     if (data.serverContent?.inputTranscription?.text) {
@@ -1289,7 +1474,11 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         this.awaitingAssistantReply = true;
         this.silenceStateMachine.onSpeechActivity();
         this.silenceNudgeStreak = 0; // reset silence streak on user speech
-        this.callEndAskCount = 0; // user is back — a fresh silence cycle starts
+        // Do NOT reset callEndAskCount here — the user just answered the
+        // "should I end the call?" question. Resetting the counter lets the
+        // exact same question repeat after 5 more silent rounds, which is
+        // exactly the infinite-loop the student is complaining about. The
+        // counter now only resets on a fresh connect (new call / reconnect).
         this.lastUserSpokenText = (this.lastUserSpokenText + ' ' + recognized).trim();
         this.activeAssistantTurnId = null;
         this.currentAssistantMessage = '';
@@ -1402,10 +1591,20 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
   sendTextMessage(text: string, displayText?: string, toolCalls?: ChatToolCallRecord[]): void {
     const trimmed = text.trim();
     if (!trimmed) return;
+    // Capture ONCE — disconnect() can null the session between the guard and
+    // the send below (TOCTOU); the local stays stable for this call.
+    const session = this.session;
 
     // During reconnect the session is null for the whole backoff+handshake.
     // Buffer the message instead of dropping it; it is flushed on reconnect.
-    if (!this.session) {
+    if (!session) {
+      // The user just acted while the connection is down — give the selected
+      // model another chance immediately (auto-retry after a failed handshake).
+      this.retryConnectIfNeeded();
+      // AUDIT FIX: bounded queue — never grow without limit during a long outage.
+      if (this.pendingTextQueue.length >= GeminiLiveClient.MAX_PENDING_TEXT_QUEUE) {
+        this.pendingTextQueue.shift();
+      }
       this.pendingTextQueue.push({ text: trimmed, displayText: displayText || trimmed, toolCalls });
       this.transcripts.push({
         id: `tr-user-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1425,16 +1624,23 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     this.currentAssistantMessage = '';
     this.pendingReasoning = '';
     this.silenceNudgeStreak = 0;
-    this.callEndAskCount = 0;
+    // NOTE: callEndAskCount intentionally NOT reset here — see reportUserTyping.
     this.awaitingAssistantReply = true;
     this.userSpeechEndedAt = Date.now();
     this.lastUserVoiceTime = Date.now();
     this.lastTurnFinishedTime = Date.now();
     this.lastSilenceNudgeAt = Date.now();
     this.silenceStateMachine.onSpeechActivity();
-    if (this.status === 'speaking') {
+    if (this.status === 'speaking' || this.audioStreamer.getPendingPlaybackMs() > 0) {
+      // Hard stop: flush BOTH the WebAudio jitter queue and the native track,
+      // then DROP any leftover audio of the OLD turn that is still in flight
+      // over the socket. Otherwise her already-planned reply keeps playing AND
+      // the answer to the new text ALSO plays → the "pehle wala bhi, mera reply
+      // bhi" double message. See shouldSuppressStaleAssistantOutput().
       this.audioStreamer.flushPlayback();
       this.setStatus('listening');
+      this.dropStaleAssistantOutput = true;
+      this.staleDropDeadline = Date.now() + GeminiLiveClient.STALE_TURN_DROP_MS;
     }
 
     // Display clean text for the user message bubble (never dump raw tool outputs into user bubble!)
@@ -1456,11 +1662,28 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     }
 
     try {
-      this.session.sendRealtimeInput({
+      session.sendRealtimeInput({
         text: trimmed,
       });
     } catch (e) {
-      console.warn('[GeminiLive] Failed to send text message:', e);
+      // A half-dead session (socket CLOSING/CLOSED) throws here — NEVER lose
+      // the user's message: buffer it for the next reconnect and kick the
+      // auto-retry so it actually gets delivered (previously silent drop).
+      // CRITICAL: null out this.session so hasFailedConnection() returns true
+      // and retryConnectIfNeeded() actually kicks a fresh connect (the old
+      // session object is dead but was keeping the gate closed).
+      console.warn('[GeminiLive] Failed to send text message — buffering for retry:', e);
+      this.session = null;
+      // A half-dead session means the transport already broke. Record it at
+      // this timestamp even if the SDK never fired onerror/onclose, so the
+      // user-driven retry below has a fresh failure to act on.
+      this.recordConnectionFailure(e);
+      // AUDIT FIX: bounded queue — never grow without limit during a long outage.
+      if (this.pendingTextQueue.length >= GeminiLiveClient.MAX_PENDING_TEXT_QUEUE) {
+        this.pendingTextQueue.shift();
+      }
+      this.pendingTextQueue.push({ text: trimmed, displayText: displayText || trimmed, toolCalls });
+      this.retryConnectIfNeeded();
     }
   }
 
@@ -1477,7 +1700,7 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
       this.currentAssistantMessage = '';
       this.pendingReasoning = '';
       this.silenceNudgeStreak = 0;
-      this.callEndAskCount = 0;
+      // NOTE: callEndAskCount NOT reset here — see reportUserTyping.
       this.awaitingAssistantReply = true;
       this.userSpeechEndedAt = Date.now();
       this.lastUserVoiceTime = Date.now();
@@ -1503,6 +1726,45 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
   }
 
   /**
+   * P1: the student SENDS a text while Misa was speaking — drop the OLD turn's
+   * leftover audio/text until the server confirms the interruption or the
+   * safety window expires (see STALE_TURN_DROP_MS). Only the NEW reply (which
+   * starts after `serverContent.interrupted`) is allowed to play.
+   */
+  private shouldSuppressStaleAssistantOutput(): boolean {
+    if (!this.dropStaleAssistantOutput) return false;
+    if (Date.now() > this.staleDropDeadline) {
+      // Safety net: the server never confirmed the interrupt. Stop dropping so
+      // a future real reply can't be swallowed either.
+      this.dropStaleAssistantOutput = false;
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * P2: the student is TYPING in the live overlay composer. Typing is real
+   * activity — restart the conversational silence timeline (the 0-20s FOCUS /
+   * 20-60s OBSERVING / 60s+ nudge machine) so a nudge or "arey suno" callout
+   * never fires while they are composing. Does NOT interrupt playback: Misa
+   * keeps talking until the message is actually sent (see sendTextMessage).
+   */
+  reportUserTyping(): void {
+    // Typing is real user activity — also auto-retries a failed connection so
+    // the very next keystroke resurrects the call with the selected model.
+    this.retryConnectIfNeeded();
+    if (!this.session) return;
+    this.lastTurnFinishedTime = Date.now();
+    this.silenceNudgeStreak = 0;
+    // NOTE: callEndAskCount is NOT reset here — the student already answered
+    // the "end the call?" question; resetting it re-asks the same question
+    // after 5 silent rounds (the infinite loop). It only resets on a fresh
+    // connect (see connect()).
+    this.awaitingAssistantReply = false;
+    this.silenceStateMachine.onSpeechActivity();
+  }
+
+  /**
    * Append a streamed text chunk to the current assistant message while never
    * gluing words together. Gemini live chunks arrive WITHOUT surrounding
    * spaces, so a raw `+=` produces "Hikaiseho". This keeps exactly one space
@@ -1511,9 +1773,17 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
    */
   private appendAssistantText(chunk: string): void {
     if (!chunk) return;
+    // AUDIT FIX (live): "[silence]" must never enter currentAssistantMessage.
+    // It previously did, which (a) leaked the token into places that bypass
+    // updateTranscript, and (b) BLOCKED the 500ms greeting — the guard at
+    // connect() sees a non-empty currentAssistantMessage ("[silence]") and
+    // concludes "assistant already speaking, skip greeting", so a pure-silence
+    // reply from the model right after connect silently swallowed the greeting.
+    const clean = stripSilenceToken(chunk);
+    if (!clean) return; // pure "[silence]" chunk — treat as no-op, keep message empty
     const existing = this.currentAssistantMessage;
     if (!existing) {
-      this.currentAssistantMessage = chunk.trimStart();
+      this.currentAssistantMessage = clean.trimStart();
       return;
     }
     // Only insert a space when the existing text ends with an actual word
@@ -1521,24 +1791,33 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     // chunks that already carry leading/trailing whitespace are left as-is
     // so "hai." or " kaise" don't get an extra space injected.
     const lastChar = existing[existing.length - 1];
-    const firstChar = chunk[0];
+    const firstChar = clean[0];
     const needsSpace =
       /\w/.test(lastChar) &&
       /\w/.test(firstChar);
-    this.currentAssistantMessage = existing + (needsSpace ? ' ' : '') + chunk;
+    this.currentAssistantMessage = existing + (needsSpace ? ' ' : '') + clean;
   }
 
   private updateTranscript(role: 'user' | 'assistant', text: string, isInterrupted = false): void {
+    // "[silence]" is a no-op token (user rule, chat + live): a pure "[silence]"
+    // turn must NEVER create a visible transcript, and embedded tokens are
+    // stripped so the pause marker never shows in live text either.
+    const clean = stripSilenceToken(text ?? '');
+    if (isPureSilenceToken(clean)) return;
+
     if (role === 'assistant') {
       const existingItem = this.activeAssistantTurnId
         ? this.transcripts.find((t) => t.id === this.activeAssistantTurnId)
         : null;
 
       if (existingItem && !existingItem.isInterrupted) {
-        existingItem.text = text;
+        existingItem.text = clean;
         existingItem.isInterrupted = isInterrupted;
         if (this.pendingReasoning) {
-          existingItem.reasoning = (existingItem.reasoning || '') + this.pendingReasoning;
+          const reasonClean = stripSilenceToken(this.pendingReasoning);
+          if (!isPureSilenceToken(reasonClean)) {
+            existingItem.reasoning = (existingItem.reasoning || '') + reasonClean;
+          }
           this.pendingReasoning = '';
         }
         if (this.pendingToolCalls.length > 0) {
@@ -1549,16 +1828,18 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         const id = `tr-asst-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         this.activeAssistantTurnId = id;
         const activeCalls = this.pendingToolCalls.length > 0 ? [...this.pendingToolCalls] : undefined;
-        const reason = this.pendingReasoning || undefined;
+        const reasonRaw = this.pendingReasoning || '';
+        const reason = stripSilenceToken(reasonRaw);
         this.pendingToolCalls = [];
         this.pendingReasoning = '';
         this.transcripts.push({
           id,
           role: 'assistant',
-          text,
+          text: clean,
           timestamp: new Date().toISOString(),
           isInterrupted,
-          reasoning: reason,
+          // Silence-only thinking is dropped too ("[silence] wale thinking").
+          reasoning: isPureSilenceToken(reason) ? undefined : reason,
           toolCalls: activeCalls,
         });
       }
@@ -1568,7 +1849,7 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         : null;
 
       if (existingItem && !existingItem.isInterrupted) {
-        existingItem.text = text;
+        existingItem.text = clean;
         existingItem.isInterrupted = isInterrupted;
       } else {
         const id = `tr-user-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -1576,10 +1857,31 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         this.transcripts.push({
           id,
           role: 'user',
-          text,
+          text: clean,
           timestamp: new Date().toISOString(),
           isInterrupted,
         });
+      }
+    }
+
+    // Hang-fix P4: bound the transcript. If pruning ever drops the ACTIVE turn
+    // (long call where the oldest item is the one still streaming), clear the
+    // id so the next chunk starts a fresh item instead of silently merging
+    // into nothing.
+    if (this.transcripts.length > GeminiLiveClient.MAX_TRANSCRIPTS) {
+      const excess = this.transcripts.length - GeminiLiveClient.MAX_TRANSCRIPTS;
+      this.transcripts.splice(0, excess);
+      if (
+        this.activeAssistantTurnId &&
+        !this.transcripts.some((t) => t.id === this.activeAssistantTurnId)
+      ) {
+        this.activeAssistantTurnId = null;
+      }
+      if (
+        this.activeUserTurnId &&
+        !this.transcripts.some((t) => t.id === this.activeUserTurnId)
+      ) {
+        this.activeUserTurnId = null;
       }
     }
 
@@ -1596,6 +1898,20 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
   private isReconnecting = false;
   private reconnectAttempts = 0;
   /**
+   * ── Stale assistant output drop (send-during-speech fix) ──
+   * Set when the student SENDS a text message mid-speech: drop her OLD turn's
+   * leftover audio/text until the server confirms the interruption
+   * (`serverContent.interrupted`) or the safety deadline passes.
+   */
+  private dropStaleAssistantOutput = false;
+  private staleDropDeadline = 0;
+  /** Last call's recent transcript — seeded into the greeting when the student
+   *  redials within 2 minutes so Misa CONTINUES the previous conversation
+   *  instead of forgetting it ("cut karke firse lagaya toh bhool gayi"). */
+  // P3: seeded from module-level so a NEW client (quick redial) inherits the
+  // previous call's transcript snapshot from the just-destroyed instance.
+  private lastCallTranscriptSnapshot: string[] = globalLastCallTranscriptSnapshot;
+  /**
    * Review 7 / P2: the reconnect worker is a single, cancellable task.
    * - `reconnectTimer` holds the in-flight backoff setTimeout so disconnect()
    *   can clearTimeout() it the moment the user hangs up (immediate cancel,
@@ -1607,7 +1923,64 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
    */
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectEpoch = 0;
+  private visibilityHandlerInstalled = false;
+  /** Mid-call settings change (reconnectWithNewConfig) — skip the opening greeting. */
+  private continueCallWithoutRegreeting = false;
   private currentMediaStream: MediaStream | null = null;
+  /** Mic handed over after a failed START so the user's next text/speech can auto-retry. */
+  private retryStashedStream: MediaStream | null = null;
+  /** Set whenever a connect attempt fails terminally — used to auto-retry on user activity. */
+  private lastConnectionErrorAt = 0;
+  /** Last terminal failure, kept so user-activity retries can advance the model chain. */
+  private lastConnectionError: any = null;
+  /** True while tryModelFallback's recursive connect is in-flight — blocks
+   *  retryConnectIfNeeded from advancing the chain a second time. */
+  private modelFallbackInFlight = false;
+  /** One-shot budget for the gateway model-discovery fallback. Reset ONLY on a
+   *  fresh user-initiated connect (never during a fallback recursion), so a
+   *  dead gateway list can't spin — the user stays in control via Live Settings. */
+  private gatewayDiscoveryAttempted = false;
+  /** Models already rejected during the current connect cascade (configured
+   *  chain + gateway list) — gateway discovery skips them so it never retries
+   *  a model that just failed, and it never loops. */
+  private triedModelsInCascade = new Set<string>();
+
+  /**
+   * Background-tab recovery handler. Browsers suspend the AudioContext and
+   * throttle ALL timers when a tab is hidden — so a reply that arrived while
+   * hidden never played, the status stuck on 'speaking', and reconnects were
+   * delayed. On return to the tab: resume/unfreeze audio, instantly retry a
+   * failed connection (no waiting for a throttled backoff timer), and re-anchor
+   * the silence timeline so we never nudge the split second we become visible.
+   */
+  private handleDocumentVisibilityChange = (): void => {
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+    this.audioStreamer.resumeForVisibility();
+    this.retryConnectIfNeeded();
+    this.lastTurnFinishedTime = Date.now();
+    this.lastSilenceNudgeAt = Date.now();
+    if (this.session) {
+      this.flushPendingTextQueue();
+    }
+  };
+
+  private installVisibilityHandler(): void {
+    if (typeof document === 'undefined') return;
+    if (this.visibilityHandlerInstalled) return;
+    document.addEventListener('visibilitychange', this.handleDocumentVisibilityChange);
+    this.visibilityHandlerInstalled = true;
+  }
+
+  private removeVisibilityHandler(): void {
+    if (typeof document === 'undefined') return;
+    if (!this.visibilityHandlerInstalled) return;
+    document.removeEventListener('visibilitychange', this.handleDocumentVisibilityChange);
+    this.visibilityHandlerInstalled = false;
+  }
+  /** Throttles speech-triggered auto-retries so a noisy room can't loop reconnect calls. */
+  private lastSpeechRetryKickAt = 0;
+  /** Post-playback echo-cooldown window (raised mic RMS gate) — see sendAudioChunk. */
+  private playbackCooldownUntil = 0;
   private activeApiKey: string | null = null;
   /** SmartRotator server root (no /v1) used for the Live WebSocket relay. */
   private activeBaseUrl: string | null = null;
@@ -1642,9 +2015,15 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         connection,
         new Promise<T>((_, reject) => {
           timeout = setTimeout(() => {
-            if (this.isActiveAttempt(attempt)) {
-              reject(new Error(`Gemini Live connection timed out after ${GeminiLiveClient.CONNECTION_TIMEOUT_MS / 1000} seconds. Check your network, API key, and selected model.`));
-            }
+            // ALWAYS settle the race — never leave the caller hanging. When the
+            // attempt went stale (hangup/replaced), still reject with a distinct
+            // message; connect()'s catch rethrows it for a stale attempt (the
+            // overlay's rollback is guarded against clobbering a newer session).
+            reject(
+              this.isActiveAttempt(attempt)
+                ? new Error(`Gemini Live connection timed out after ${GeminiLiveClient.CONNECTION_TIMEOUT_MS / 1000} seconds. Check your network, API key, and selected model.`)
+                : new Error('Gemini Live connection was cancelled or replaced.'),
+            );
           }, GeminiLiveClient.CONNECTION_TIMEOUT_MS);
         }),
       ]);
@@ -1654,11 +2033,40 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
   }
 
   private toConnectionErrorMessage(error: any): string {
-    const message = String(error?.message || 'Failed to establish Gemini Live connection');
+    const message = String(error?.message || '').trim();
     if (this.isModelAvailabilityError(error)) {
-      return `Selected Live model “${this.config.model}” is unavailable. Choose another Live-compatible model and try again.`;
+      return `Selected Live model “${this.config.model}” is unavailable via ${this.activeBaseUrl ? 'your gateway' : 'Google'}. The app auto-tried the fallback models. Choose another Live-compatible model in Live Settings and try again.`;
     }
-    return message;
+    if (message) return this.scrubSensitiveError(message);
+    // Opaque/empty failure (e.g. raw WS close with no reason on Linux): tell the
+    // student WHERE and what to check instead of an inert generic string.
+    const endpoint = this.activeBaseUrl?.trim() || 'Google Gemini';
+    return `Unable to reach the Live endpoint (${endpoint}). Check the network and that the selected model is supported there, then retry.`;
+  }
+
+  /**
+   * AUDIT FIX (round 3, SEVERE): strip the configured gateway URL, the API key,
+   * and `key=` query params out of raw SDK error text before it can reach the
+   * UI. Provider/gateway errors often echo the endpoint (wss://...BidiGenerateContent)
+   * or even the API key; the overlay additionally scrubs, so this is defense in
+   * depth at the source.
+   */
+  private scrubSensitiveError(message: string): string {
+    let out = String(message ?? '');
+    const base = this.activeBaseUrl?.trim();
+    if (base) {
+      try {
+        const u = new URL(base);
+        out = out.split(base.replace(/\/+$/, '')).join('[your-gateway]');
+        out = out.split(u.host).join('[your-gateway-host]');
+      } catch {
+        out = out.split(base).join('[your-gateway]');
+      }
+    }
+    const key = this.activeApiKey?.trim();
+    if (key && key.length >= 4) out = out.split(key).join('***');
+    out = out.replace(/([?&]key=)[^&\s"'<>]+/gi, '$1***');
+    return out.trim();
   }
 
   /**
@@ -1691,7 +2099,199 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
   }
 
   private isModelAvailabilityError(error: any): boolean {
-    return /model|not found|unsupported/i.test(String(error?.message || ''));
+    // The BidiGenerateContent WebSocket is rejected with a wide variety of
+    // payloads depending on the provider:
+    //   Google: "Selected Live model ... is unavailable or is not supported by
+    //           your API key", "models/... is not found", INVALID_ARGUMENT
+    //           "... does not support live generation"
+    //   Gateway/relay: HTTP 400/404 with JSON bodies that often surface as an
+    //           EMPTY/opaque error (the Linux "error 0 0" mystery — the raw WS
+    //           close carries NO message, so the old message-only regex never
+    //           matched and the call sat dead on 'error' while ANY model change
+    //           in Live Settings fixed it).
+    // AUDIT FIX (round 1, MEDIUM): status-only matching is dangerous when too
+    // broad — a bad key (403) or wrong gateway path (404) would be misread as
+    // "model unavailable", burn the whole fallback chain, and (worse) make
+    // isPermanentConnectionError kill the recoverable auto-reconnect. So:
+    //   • a model/phrase ALWAYS means model-availability;
+    //   • a bare HTTP 400/404 counts ONLY when dialing a user gateway (never
+    //     403/401 — those are credentials) since native Google always ships a
+    //     message body.
+    const raw = [
+      String(error?.message ?? ''),
+      String(error?.status ?? ''),
+      String(error?.code ?? ''),
+      String(error?.reason ?? ''),
+    ].join(' ');
+    if (/model|not found|not supported|unsupported|unavailable|does not support|invalid argument|no such model|not allowed|permission denied/i.test(raw)) {
+      return true;
+    }
+    const base = this.activeBaseUrl?.trim();
+    return !!base && !base.includes('generativelanguage.googleapis.com') && /\b(400|404)\b/.test(raw);
+  }
+
+  /**
+   * The user-configured auto-fallback model chain. Prefers
+   * `this.config.fallbackModels` when non-empty; otherwise falls back to the
+   * built-in default. Filters out empty/whitespace entries and (hard requirement)
+   * always dedupes so a model never appears twice.
+   */
+  private effectiveFallbackChain(): string[] {
+    const configured = Array.isArray(this.config?.fallbackModels)
+      ? this.config.fallbackModels.map((m) => m.trim()).filter(Boolean)
+      : [];
+    const source = configured.length > 0 ? configured : LIVE_MODEL_FALLBACK_DEFAULT;
+    return Array.from(new Set(source));
+  }
+
+  /**
+   * Model auto-fallback — advances one step down the fallback chain and
+   * recurses connect(). Cascades naturally ACROSS the chain within a single
+   * user action: if the next model is ALSO dead, its own connect() catch runs
+   * this method again (B→C, C→…), one step per failure. There is NO in-flight
+   * guard because the SDK's onerror branch no longer kicks a competing connect
+   * (it surfaces + remembers; the promise rejection does the cascade here), so
+   * double-advance races are impossible by construction.
+   *
+   * Returns the new connect promise when a fallback was kicked, else null
+   * (chain exhausted / not a model error) so the caller keeps its normal
+   * error handling. Never loops: the chain is finite and each recursion walks
+   * strictly forward; a non-model error stops the cascade immediately.
+   */
+  private tryModelFallback(
+    error: any,
+    apiKey: string,
+    incomingCallMeta?: { isIncomingCall?: boolean; reason?: string; origin?: LiveCallOrigin } | null,
+    options?: { audioFocusAlreadyGranted?: boolean; baseUrl?: string } | null,
+  ): Promise<void> | null {
+    if (!this.isModelAvailabilityError(error)) return null;
+    const chain = this.effectiveFallbackChain();
+    const chainIndex = chain.indexOf(this.config.model);
+    if (chainIndex < 0 || chainIndex >= chain.length - 1) return null;
+    const previousModel = this.config.model;
+    // Remember the failed + next models so gateway discovery never re-tries them.
+    this.triedModelsInCascade.add(previousModel);
+    const nextModel = chain[chainIndex + 1];
+    this.triedModelsInCascade.add(nextModel);
+    this.config = { ...this.config, model: nextModel };
+    console.warn(`[GeminiLive] Model "${previousModel}" unavailable → auto-fallback to "${nextModel}".`);
+    this.callbacks.onError?.(`Model "${previousModel}" is unavailable right now — auto-switched to "${nextModel}". Adjust it anytime in Live Settings.`);
+    this.recordConnectionFailure(error);
+    // Reserve the fallback while the recursive connect is in-flight so a
+    // concurrent user activity (message/typing/visibility) doesn't advance the
+    // chain a SECOND time via retryConnectIfNeeded and skip a good model.
+    this.modelFallbackInFlight = true;
+    return this.connect(apiKey, incomingCallMeta || undefined, options || undefined).finally(() => {
+      this.modelFallbackInFlight = false;
+    });
+  }
+
+  /**
+   * Linux "error 0 0" self-heal, layer 2: when the configured fallback chain
+   * can't help (the current model is dead AND the chain is exhausted — or the
+   * current model was never in the chain), ask the USER'S GATEWAY what live
+   * models it actually serves (exactly what the Live Settings dropdown shows)
+   * and try the first model not yet attempted in this cascade. This replicates
+   * the manual fix ("model change karte hi kaam chal jaata hai") — the student
+   * picks a served model from the dropdown; here the app does it automatically.
+   *
+   * Bounded: ONE gateway discovery per fresh user connect (gatewayDiscoveryAttempted),
+   * skipped models are tracked (triedModelsInCascade), and native Google is
+   * excluded (the configured chain already covers Google). Returns the new
+   * connect promise when a discovery fallback was kicked, else null.
+   */
+  private async tryGatewayDiscoveredModel(
+    error: any,
+    apiKey: string,
+    incomingCallMeta?: { isIncomingCall?: boolean; reason?: string; origin?: LiveCallOrigin } | null,
+    options?: { audioFocusAlreadyGranted?: boolean; baseUrl?: string } | null,
+  ): Promise<Promise<void> | null> {
+    if (!this.isModelAvailabilityError(error)) return null;
+    if (this.gatewayDiscoveryAttempted) return null;
+    const base = this.activeBaseUrl?.trim();
+    // Native Google has no stale gateway model list — the fallback chain covers it.
+    if (!base || base.includes('generativelanguage.googleapis.com')) return null;
+    let candidates: string[] = [];
+    try {
+      candidates = await this.fetchGatewayLiveModels(apiKey, base);
+    } catch {
+      // AUDIT FIX: a TRANSIENT fetch failure must NOT burn the one-shot budget —
+      // keep it armed so the retry worker / next user action can re-discover
+      // after the network settles.
+      return null;
+    }
+    // Budget is spent once we actually READ the gateway list (even if it yields
+    // no candidates) — re-fetching an empty list every failure would hammer it.
+    this.gatewayDiscoveryAttempted = true;
+    const tried = this.triedModelsInCascade;
+    tried.add(this.config.model);
+    const candidate = candidates.find((m) => !tried.has(m));
+    if (!candidate) return null;
+    tried.add(candidate);
+    const previousModel = this.config.model;
+    this.config = { ...this.config, model: candidate };
+    console.warn(`[GeminiLive] Model "${previousModel}" rejected by gateway → auto-discovered "${candidate}" from the gateway's model list.`);
+    this.callbacks.onError?.(`Model "${previousModel}" is unavailable via this gateway — auto-switched to "${candidate}" from the gateway's model list.`);
+    this.recordConnectionFailure(error);
+    // Same recursion guard as the chain fallback: the recursive connect must
+    // NOT reset the fresh-call budget (see connect() entry reset condition).
+    this.modelFallbackInFlight = true;
+    return this.connect(apiKey, incomingCallMeta || undefined, options || undefined).finally(() => {
+      this.modelFallbackInFlight = false;
+    });
+  }
+
+  /**
+   * LIVE-capable models the user's gateway itself advertises (the same list
+   * fetchLiveModels shows in Live Settings — minus the hardcoded defaults,
+   * which this fallback must NOT trust: a default the gateway rejects is a
+   * wasted attempt). Names ascending so true live/audio/realtime models are
+   * tried before text-capable flash/pro candidates.
+   */
+    /** Shared guard: model-discovery fetches MUST time out so a hanging gateway
+   *  can't leave connect()/Live Settings pending forever (AUDIT FIX round 3). */
+  private static async fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...init, signal: ac.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async fetchGatewayLiveModels(apiKey: string, base: string): Promise<string[]> {
+    const cleanBase = base.replace(/\/+$/, '');
+    let res: Response;
+    try {
+      res = await GeminiLiveClient.fetchWithTimeout(
+        `${cleanBase}/models`,
+        {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'x-goog-api-key': apiKey,
+          },
+        },
+        7000,
+      );
+    } catch {
+      return []; // timeout / aborted — treat as "no candidates", caller handles empty
+    }
+    if (!res.ok) return [];
+    const data = await res.json();
+    const list = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : [];
+    const liveScore = (name: string): number => (/(live|realtime|audio)/i.test(name) ? 0 : 1);
+    return list
+      .map((m: any) => (typeof m === 'string' ? m : m.id || m.name || ''))
+      .filter(Boolean)
+      .filter((name: string) => {
+        const lower = name.toLowerCase();
+        return (
+          lower.startsWith('gemini') &&
+          (lower.includes('live') || lower.includes('realtime') || lower.includes('audio') || lower.includes('flash') || lower.includes('pro'))
+        );
+      })
+      .sort((a: string, b: string) => liveScore(a) - liveScore(b));
   }
 
   private isPermanentConnectionError(error: any): boolean {
@@ -1711,12 +2311,21 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
       }
       this.callAudioFocusGranted = true;
     }
+    // Never leak the previous mic stream (e.g. reconnectWithNewConfig after a
+    // preserved stream) — stop old tracks BEFORE adopting the new one, but only
+    // if this stream is a different object than what disconnect() stashed.
+    if (this.currentMediaStream && this.currentMediaStream !== mediaStream && this.currentMediaStream !== this.retryStashedStream) {
+      this.currentMediaStream.getTracks().forEach((t) => t.stop());
+    }
     this.currentMediaStream = mediaStream;
     this.audioStreamer.setOnPlaybackEnded(() => {
       if (this.status === 'speaking') {
         this.setStatus('listening');
         this.lastTurnFinishedTime = Date.now();
       }
+      // Post-playback echo cooldown: 1.5s of raised mic threshold so the room's
+      // speaker decay is never fed to the model as "user speech".
+      this.playbackCooldownUntil = Date.now() + 1500;
     });
     await this.audioStreamer.startRecording(
       mediaStream,
@@ -1829,10 +2438,37 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
   }
 
   private sendAudioChunk(pcm16Base64: string, rmsLevel = 0): void {
-    if (!this.session) return;
+    if (!this.session) {
+      // First audible user speech while the connection is down → auto-retry
+      // the selected model (throttled so room noise can't loop reconnect calls).
+      if (rmsLevel > 0.032 && this.hasFailedConnection()) {
+        const now = Date.now();
+        if (now - this.lastSpeechRetryKickAt > 2500) {
+          this.lastSpeechRetryKickAt = now;
+          this.retryConnectIfNeeded();
+        }
+      }
+      return;
+    }
+    // Dead/reconnecting WS guard: after disconnect the mic capture keeps
+    // running until stopRecording lands, and during a reconnect the SDK's
+    // session object outlives its WebSocket. Forwarding chunks in those
+    // windows makes the SDK throw "WebSocket is already in CLOSING or CLOSED
+    // state" for every single chunk (~23/sec) — a real console-error storm.
+    if (this.status !== 'listening' && this.status !== 'speaking') return;
 
     const now = Date.now();
-    const isSpeech = rmsLevel > 0.032 || this.isUserTalkingOverThreshold;
+    // ── Post-playback echo cooldown (GoNoGo two-tier RMS gate) ──
+    // Right after Misa's voice stops, the speakers still resonate in the room
+    // (RMS decays 0.025→0.04 for ~1.5s). If we feed that decay to the model as
+    // "user speech" she hears her OWN words back as the user's — the classic
+    // "maine kuch bola, usko kuch aur sunai diya" garbling. During the
+    // cooldown we raise the speech threshold so only real (loud) speech passes;
+    // soft background decay is dropped instead of misheard.
+    const inPlaybackCooldown = now < this.playbackCooldownUntil;
+    const isSpeech = inPlaybackCooldown
+      ? rmsLevel > 0.055 || this.isUserTalkingOverThreshold
+      : rmsLevel > 0.032 || this.isUserTalkingOverThreshold;
 
     // Barge-in debounce (shared with the analyser path): a single transient
     // chunk (room echo, keyboard, cough) must not snip the assistant's voice.
@@ -1945,7 +2581,7 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         if (!this.isActiveAttempt(attempt)) return;
         try {
           this.session?.sendRealtimeInput({
-            text: `[Screen share is on. Look at what is open on the screen right now and comment or ask directly about what you see in 1 short, natural, friendly Hinglish sentence (e.g. specific question, YouTube video, notes, or app). Do NOT say 'main screen dekh rahi hu', speak directly about the screen content.]`,
+            text: `[Screen share is on. Look at the ACTUAL screen content you receive and comment or ask directly about what you clearly see in 1 short, natural, friendly Hinglish sentence. CRITICAL: describe ONLY what is truly visible on the screen. If the screen is blank, black, a loading screen, or not yet clearly visible, do NOT guess or invent content — stay quiet and wait for the real content instead of asking about "YouTube" or "questions" you cannot actually see.]`,
           });
         } catch (e) {
           console.warn('[GeminiLive] Failed to send screen start prompt:', e);
@@ -2163,6 +2799,9 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
 
   private startKeepAliveAndSilenceObserver(): void {
     this.lastWsActivity = Date.now();
+    // Background-tab recovery: a hidden tab suspends audio + throttles timers —
+    // hook visibility so returning instantly unfreezes the call.
+    this.installVisibilityHandler();
     // Preserve the silence/anchor timer across reconnects — a reconnect is a
     // continuation, not a fresh call, so the streak and tunnel state carry on.
     if (this.reconnectAttempts === 0) this.lastTurnFinishedTime = Date.now();
@@ -2262,7 +2901,13 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         } else if (this.silenceNudgeStreak > 6) {
           promptText = `[QUIET COMPANION] ${baseCtx}. The student is deep in quiet work. Do NOT ask questions and do NOT end the call on your own. If you speak at all, say at most 1 short warm whisper acknowledging their focus (your own words), otherwise stay silently present.`;
         } else {
-          promptText = `[CONTEXT UPDATE] ${baseCtx}`;
+          // AUDIT FIX (live): the context-update nudge MUST explicitly ask for
+          // a spoken line. SILENCE_TOKEN_RULE tells the model to reply "[silence]"
+          // while idling/observing — without an explicit "speak now" here, the
+          // nudge would feed context and get [silence] back, leaving the student
+          // in dead air. The student's exact complaints: "mai chup rha toh woh
+          // chup hi reh rhi hai", "greeting bhi nhi deti hai".
+          promptText = `[CONTEXT UPDATE] ${baseCtx}. The student is quiet — say ONE short warm natural line out loud now (your own words, aap/tum), then go back to listening for them. Do NOT reply "[silence]" to this update.`;
         }
 
         try {
@@ -2279,6 +2924,7 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     if (this.isReconnecting || this.isUserExplicitlyClosed) return;
     if (!canRetryLiveConnection(this.reconnectAttempts)) {
       this.setStatus('error');
+      this.recordConnectionFailure(new Error('Reconnect attempts exhausted'));
       this.callbacks.onError?.('Network connection could not be restored. End the call or try again.');
       return;
     }
@@ -2326,6 +2972,12 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         this.isReconnecting = false;
         return;
       }
+      // A network reconnect is a CONTINUATION of the SAME call, never a new
+      // one — the greeting timer must not fire "student phoned you!" again.
+      // The flag is read inside connect()'s greeting timeout; reconnectAttempts
+      // alone is unreliable there (it resets to 0 right after a successful
+      // reconnect, racing the 500ms greeting timer).
+      this.continueCallWithoutRegreeting = true;
       await this.connect(this.activeApiKey, {
         isIncomingCall: this.isIncomingCallSession,
         reason: this.incomingCallReason,
@@ -2333,18 +2985,29 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         // don't degrade to the wrong role mid-call.
         origin: this.callOrigin,
       });
+      // AUDIT FIX (round 1, SEVERE): connect() unconditionally runs
+      // disconnect(true) at entry, and disconnect() bumps reconnectEpoch on
+      // EVERY teardown. The PRE-connect `epoch` captured above is therefore
+      // ALWAYS stale the moment connect() resolves — gating against it made the
+      // worker self-invalidate right after a successful reconnect: startVoiceStreaming
+      // never re-attached the mic (disconnect(true) stopped recording), Misa
+      // stayed deaf after every blip, and reconnectAttempts never reset so the
+      // retry budget silently drained. Re-capture the epoch AFTER the awaited
+      // handshake; the gates below then correctly detect a hangup that lands
+      // during/after the reconnect (epoch moves again past epochAfterConnect).
+      const epochAfterConnect = this.reconnectEpoch;
       // Review-8 P1: strict invariant — once the epoch is stale (a hangup landed
-      // during the handshake/audio setup) this worker must not perform ANY
-      // further session mutation.
-      if (epoch !== this.reconnectEpoch || this.isUserExplicitlyClosed) {
+      // during the audio setup) this worker must not perform ANY further session
+      // mutation.
+      if (epochAfterConnect !== this.reconnectEpoch || this.isUserExplicitlyClosed) {
         this.isReconnecting = false;
         return;
       }
-      if (this.currentMediaStream) {
-        await this.startVoiceStreaming(this.currentMediaStream);
+      if (this.currentMediaStream || this.retryStashedStream) {
+        await this.startVoiceStreaming(this.currentMediaStream || this.retryStashedStream!);
       }
       // Review-8 P1: same guard before the session mutation (vision re-orient).
-      if (epoch !== this.reconnectEpoch || this.isUserExplicitlyClosed) {
+      if (epochAfterConnect !== this.reconnectEpoch || this.isUserExplicitlyClosed) {
         this.isReconnecting = false;
         return;
       }
@@ -2369,10 +3032,86 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     } catch (e) {
       console.warn('[GeminiLive] Reconnect attempt failed:', e);
       this.isReconnecting = false;
-      if (!this.isUserExplicitlyClosed) {
+      if (this.isUserExplicitlyClosed) return;
+      // NEVER recurse on permanent/model failures — a dead model or bad key
+      // would loop forever (and with reconnectAttempts no longer reset it
+      // WOULD hit the cap, but only after wasting battery on an 85s storm).
+      // Transient failures keep retrying, bounded by MAX_LIVE_RECONNECT_ATTEMPTS.
+      if (!this.isPermanentConnectionError(e) && canRetryLiveConnection(this.reconnectAttempts)) {
         void this.handleAutoReconnect();
+      } else {
+        this.setStatus('error');
+        this.recordConnectionFailure(e);
+        this.callbacks.onError?.(this.toConnectionErrorMessage(e));
       }
     }
+  }
+
+  // ===== Auto-retry after a failed connect (production hardening) =====
+  // One failed handshake used to leave the UI stuck on status 'error' forever
+  // — the SDK's onclose/onerror never fire for a socket that never opened, so
+  // handleAutoReconnect() never ran. Now we remember the failure and give the
+  // SAME selected model another chance right when the user acts next (types a
+  // message or speaks), instead of forcing them to re-tap Live Call.
+
+  private recordConnectionFailure(error?: any): void {
+    this.lastConnectionErrorAt = Date.now();
+    this.lastConnectionError = error ?? null;
+    if (error) {
+      // Diagnostics breadcrumb (the "error 0 0" mystery): every terminal
+      // failure is logged with its RAW payload so a repro has a searchable
+      // cause instead of an opaque WS close. message/code/status/reason all captured.
+      console.info('[GeminiLive] Connection failure recorded:', {
+        message: String(error?.message ?? ''),
+        code: error?.code ?? null,
+        status: error?.status ?? null,
+        reason: error?.reason ?? error?.reasonPhrase ?? null,
+        raw: typeof error === 'object' ? JSON.stringify(error) : String(error),
+      });
+    }
+    // NOTE: deliberately does NOT reset reconnectAttempts. Resetting here was
+    // the "infinite reconnect storm" bug — every failed connect zeroed the
+    // counter, so handleAutoReconnect's retry loop could never hit its cap.
+    // Only the USER-ACTIVITY path (retryConnectIfNeeded) resets it, giving the
+    // next message/typing/speech a fresh chance while SDK-driven retries stay
+    // bounded.
+  }
+
+  /** True when the last connect attempt failed and nothing is retrying yet. */
+  hasFailedConnection(): boolean {
+    return this.lastConnectionErrorAt > 0 && !this.session && !this.isReconnecting && !this.isUserExplicitlyClosed;
+  }
+
+  /** Hand the still-live mic to the client for a later automatic retry (failed start). */
+  stashRetryMicStream(stream: MediaStream | null): void {
+    this.retryStashedStream = stream;
+  }
+
+  /**
+   * Retry the connection with the currently selected model, triggered by the
+   * user's next action. No-op unless a failure is actually pending — safe to
+   * call from sendTextMessage/sendAudioChunk on every user interaction.
+   */
+  retryConnectIfNeeded(): void {
+    if (!this.hasFailedConnection()) return;
+    this.lastConnectionErrorAt = 0;
+    // Belt & suspenders for the no-reject SDK edge: a model that FAILED last
+    // time must not be retried forever — advance the chain ONE step before the
+    // user-driven retry (the connect-catch cascade already handles the normal
+    // path; this covers a socket that errors without rejecting its promise).
+    if (this.lastConnectionError && !this.modelFallbackInFlight && this.isModelAvailabilityError(this.lastConnectionError)) {
+      const chain = this.effectiveFallbackChain();
+      const idx = chain.indexOf(this.config.model);
+      if (idx >= 0 && idx < chain.length - 1) {
+        this.config = { ...this.config, model: chain[idx + 1] };
+        console.info(`[GeminiLive] User retry → advancing model to "${this.config.model}".`);
+      }
+    }
+    // Fresh chance for the user-driven retry (resets the SDK backoff counter;
+    // SDK-driven retries stay bounded by the cap — see recordConnectionFailure).
+    this.reconnectAttempts = 0;
+    console.info('[GeminiLive] User activity → auto-retry connect with model:', this.config.model);
+    void this.handleAutoReconnect().catch((e) => console.warn('[GeminiLive] Auto-retry failed:', e));
   }
 
   /**
@@ -2383,17 +3122,22 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
    *   abandon the pre-capture focus the client is about to rely on.
    */
   disconnect(preserveReconnectState = false, skipNativeAudioReset = false): void {
+    // AUDIT FIX (round 1, MEDIUM): capture whether a live session existed
+    // BEFORE any of the teardown blocks run. The old guard `sessionStartTime >= 0`
+    // was vacuous (it is zeroed below), so a failed fresh connect that never
+    // established a session could re-record the PREVIOUS call's end-time/duration
+    // and inflate totalCalls. Function-scoped so the later recording block in
+    // the same explicit-teardown branch can read it.
+    const hadLiveSession = this.sessionStartTime > 0;
     if (!preserveReconnectState) {
       this.connectionAttempt += 1;
       this.isUserExplicitlyClosed = true;
-      if (this.sessionStartTime > 0) {
+      if (hadLiveSession) {
         globalLastCallEndedAt = Date.now();
         globalLastCallDurationSec = Math.round((Date.now() - this.sessionStartTime) / 1000);
         wasLastCallUserExplicitHangup = true;
       }
       this.sessionStartTime = 0;
-    } else {
-      wasLastCallUserExplicitHangup = false;
     }
     // P2: cancel any pending reconnect backoff NOW. Clearing the timer kills
     // the scheduled wakeup; bumping the epoch makes a worker that already woke
@@ -2414,6 +3158,15 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         } catch {}
       }
       this.currentMediaStream = null;
+      // A stashed retry mic belongs to the same failed call — only an explicit
+      // hangup releases it; a reconnect-internal teardown keeps it for retry.
+      if (this.retryStashedStream) {
+        try {
+          this.retryStashedStream.getTracks().forEach((t) => t.stop());
+        } catch {}
+      }
+      this.retryStashedStream = null;
+      this.lastConnectionErrorAt = 0;
       this.activeApiKey = null;
     }
     if (this.silenceObserverTimer) {
@@ -2435,7 +3188,8 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     // streaming again (reconnect does its own ordered setup — M7).
     this.callAudioFocusGranted = false;
     if (this.audioFocusListener) {
-      void this.audioFocusListener.remove();
+      // remove() may return a Promise (Capacitor) or void (mock/desktop).
+      try { void (this.audioFocusListener.remove() as any)?.catch?.(() => {}); } catch {}
       this.audioFocusListener = null;
     }
     // INTENTIONAL BEHAVIOR PRESERVED: an explicit hangup (preserve=false) MUST
@@ -2444,6 +3198,32 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     // WebSocket reconnects and only voice comes back (Review 3 issue #1).
     if (!preserveReconnectState) {
       this.visionStreamer.stop();
+      // P3: remember the final exchanges of THIS call (as readable text) so a
+      // quick redial can seed them into the greeting — the model then CONTINUES
+      // the previous conversation instead of "forgetting" it after a cut/reconnect.
+      // CRITICAL: silence nudges / call-end asks are FILTERED OUT. Without this,
+      // a call that ended while Misa was nudging ("kya aap silent ho?") re-seeds
+      // THAT complaint into the next call's greeting — "call laga ke silent mode
+      // me chale gaye" on a fresh call.
+      this.lastCallTranscriptSnapshot = this.transcripts
+        .slice(-10)
+        .filter((t) => !(t.role === 'assistant' && MISA_FILLER_LINE_RE.test(t.text)))
+        .map((t) => `${t.role === 'user' ? 'Student' : 'Misa'}: ${t.text}`);
+      // Promote to module-level so a NEW GeminiLiveClient (quick redial) still
+      // has access to the prior conversation context.
+      globalLastCallTranscriptSnapshot = this.lastCallTranscriptSnapshot;
+      // PERSIST into the cross-reload call history so a LATER redial (minutes,
+      // hours, or next day) remembers how many calls happened and when — the
+      // agent can then say "kal bhi toh call kiya tha" / "kitni baar call kiye".
+      // AUDIT FIX: only persist when a live session actually existed in THIS
+      // disconnect (hadLiveSession) — a stale module global from a previous
+      // call must never be re-recorded by a failed/phantom teardown.
+      if (hadLiveSession && globalLastCallEndedAt > 0) {
+        recordLiveCall(globalLastCallEndedAt, globalLastCallDurationSec, (prev) => {
+          const next = this.lastCallTranscriptSnapshot;
+          return next.length > 0 ? next : prev;
+        });
+      }
     }
     // P7 + review-7 P0: store (never fire-and-forget) so the next
     // setupCallAudio() serializes after this reset — the route can no longer
@@ -2484,6 +3264,12 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     if (!preserveReconnectState) {
       this.isIncomingCallSession = false;
       this.incomingCallReason = '';
+      // Tear down the visibility listener on explicit hangup so it doesn't
+      // fire after the call ends (latent leak + spurious retries on tab switch).
+      this.removeVisibilityHandler();
+      // A hangup is a NEW call next time — never inherit a pending
+      // "settings changed, continue" continuation flag from a stale connect.
+      this.continueCallWithoutRegreeting = false;
     }
   }
 
@@ -2505,6 +3291,7 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
   static async fetchLiveModels(apiKey: string, baseUrl?: string, preconfiguredModels: string[] = []): Promise<string[]> {
     const defaults = [
       'gemini-3.1-flash-live-preview',
+      'gemini-2.5-flash-native-audio-latest',
       'gemini-2.5-flash-native-audio-preview-09-2025',
       'gemini-2.5-flash',
       'gemini-2.5-pro',
@@ -2525,12 +3312,16 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
       const cleanBase = baseUrl.replace(/\/+$/, '');
       try {
         const url = `${cleanBase}/models`;
-        const res = await fetch(url, {
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'x-goog-api-key': apiKey,
+        const res = await GeminiLiveClient.fetchWithTimeout(
+          url,
+          {
+            headers: {
+              'Authorization': `Bearer ${apiKey}`,
+              'x-goog-api-key': apiKey,
+            },
           },
-        });
+          7000,
+        );
         if (res.ok) {
           const data = await res.json();
           const list = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : [];
@@ -2544,7 +3335,7 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     // 2. If no custom models fetched, try Google Generative Language API
     if (rawModels.length === 0) {
       try {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+        const res = await GeminiLiveClient.fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, {}, 7000);
         if (res.ok) {
           const data = await res.json();
           const models: any[] = data?.models ?? [];
@@ -2632,6 +3423,13 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
                   }, 1200);
                 }
               },
+              // AUDIT FIX (round 3, LOW): release the ephemeral AudioContext
+              // when the preview WebSocket closes (error or normal teardown).
+              onclose: () => {
+                window.setTimeout(() => {
+                  try { if (audioCtx.state !== 'closed') void audioCtx.close(); } catch { /* best-effort */ }
+                }, 1500);
+              },
             },
           });
 
@@ -2642,6 +3440,7 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
           // Wait up to 3.5 seconds for preview audio
           await new Promise((resolve) => setTimeout(resolve, 3500));
           try { liveSession.close(); } catch {}
+          try { if (audioCtx.state !== 'closed') void audioCtx.close(); } catch {}
           if (hasPlayed) return;
         }
       } catch (err) {
@@ -2650,7 +3449,7 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
 
       // 2. Try generateContent audio candidates
       const candidates = Array.from(
-        new Set([model, 'gemini-2.0-flash-exp', 'gemini-2.0-flash-realtime-exp', 'gemini-2.5-flash-native-audio-preview-09-2025'].filter(Boolean)),
+        new Set([model, 'gemini-2.0-flash-exp', 'gemini-2.0-flash-realtime-exp', 'gemini-2.5-flash-native-audio-latest', 'gemini-2.5-flash-native-audio-preview-09-2025'].filter(Boolean)),
       );
       for (const m of candidates) {
         try {
@@ -2686,6 +3485,8 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
             const blob = new Blob([bytes], { type: mimeType });
             const url = URL.createObjectURL(blob);
             const audio = new Audio(url);
+            // AUDIT FIX (round 3, LOW): release the blob URL once playback ends.
+            audio.addEventListener('ended', () => URL.revokeObjectURL(url), { once: true });
             audio.volume = 1.0;
             await audio.play();
             return;

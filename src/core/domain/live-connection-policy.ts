@@ -5,24 +5,22 @@ export function isPermanentLiveConnectionError(error: unknown): boolean {
 }
 
 /**
- * INTENTIONAL SAFETY LIMIT (review item 4 / review 7 P2): with 20s-capped
- * exponential backoff, 500 attempts ≈ 2.5–3 hours of continuous retry on a
- * permanently-down link.
+ * SAFETY VALVE: 4 attempts with the 20s-capped exponential backoff ≈ 22s of
+ * continuous auto-retry (0.75+1.5+3+6 ≈ 11s + jitter, then the user's next
+ * message/typing/speech resets the counter for a fresh chance) — enough for a
+ * real mid-call mobile blip, then the valve trips to a clear error card.
  *
  * CONTRACT CLARIFICATION: this constant is a TERMINAL SAFETY VALVE only, not
- * the product's call-termination policy. The product contract stays
- * "an explicit hangup is the only way a call ends" — the caller never enters
- * this loop once the user hangs up (the reconnect worker is also cancelled
- * immediately on hangup: pending backoff timer cleared + epoch token bumped).
- * The cap exists purely so a PATHOLOGICAL state (lost device, battery-dead
- * background worker, a socket that never errors cleanly) cannot spin forever.
- *
- * When the valve trips the user sees a clear error card ("Network connection
- * could not be restored. End the call or try again.") — the outage ceiling is
- * therefore USER-VISIBLE and documented, not silent. If the product wants a
- * call to survive longer than ~3h of link outage, raise this single knob.
+ * the product's call-termination policy. An explicit hangup always cancels the
+ * worker immediately (pending backoff timer cleared + epoch bumped), and the
+ * USER-ACTIVITY auto-retry path (`retryConnectIfNeeded`) resets the counter —
+ * so after the valve trips, the NEXT message/typing/speech still gets a fresh
+ * chance. 500 attempts (~3h) was an endless error-spam storm on mobile; the
+ * user-action reset makes a small cap safe. Set to 4 per the student's
+ * explicit requirement: just enough auto-retries for a blip, and each message
+ * after a failure immediately kicks a fresh reconnect.
  */
-export const MAX_LIVE_RECONNECT_ATTEMPTS = 500;
+export const MAX_LIVE_RECONNECT_ATTEMPTS = 4;
 
 export function canRetryLiveConnection(attempt: number): boolean {
   return attempt < MAX_LIVE_RECONNECT_ATTEMPTS;

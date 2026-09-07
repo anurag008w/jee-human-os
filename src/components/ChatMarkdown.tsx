@@ -1,8 +1,9 @@
-import { Component, useState, useEffect, type ReactNode } from 'react';
+import { Component, useState, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeHighlight from 'rehype-highlight';
+import rehypeKatexBase from 'rehype-katex';
 import 'katex/dist/katex.min.css';
 import { Check, Copy } from 'lucide-react';
 import { unwrapMarkdownFence, normalizeLatexDelimiters } from './markdown-utils';
@@ -176,35 +177,17 @@ class MdBoundary extends Component<{ text: string; children: ReactNode }, { fail
 }
 
 export default function ChatMarkdown({ text }: { text: string }) {
-  const [rehypeKatex, setRehypeKatex] = useState<((options?: object) => object) | null>(null);
-  
-  // Load KaTeX renderer on the client; CSS is bundled above so MathML/HTML
-  // layers never overlap while the CDN is still loading or unavailable.
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    let mounted = true;
-
-    import('rehype-katex')
-      .then((module) => {
-        if (mounted) setRehypeKatex(() => module.default);
-      })
-      .catch(() => {
-        console.warn('Failed to load KaTeX, math rendering disabled');
-      });
-
-    return () => { mounted = false; };
-  }, []);
-
   const processed = sanitizeControlTokens(normalizeLatexDelimiters(unwrapMarkdownFence(text)));
   
+  // KaTeX is now a STATIC import — no more first-render flash of raw LaTeX and
+  // no more intermittent silent failure from a broken dynamic import(). The CSS
+  // was already static (line 6) so there was never a real reason to lazy-load
+  // the JS half.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const plugins: any[] = [
+    [rehypeKatexBase, { output: 'html', strict: false, trust: false, maxSize: 100, errorColor: '#e0645a' }],
     [rehypeHighlight, { detect: false, plainText: ['txt', 'text', 'plaintext', 'md', 'markdown', 'log'] }],
   ];
-  
-  if (rehypeKatex) {
-    plugins.unshift([rehypeKatex, { output: 'html', strict: false, trust: false, maxSize: 100, errorColor: '#e0645a' }]);
-  }
 
   return (
     <MdBoundary text={processed}>

@@ -129,6 +129,10 @@ export class LocalStateRepository {
   private readonly store: KeyValueRepository;
   /** Set when save() had to trim memory to fit the quota (M7). */
   private pruneNotice: string | null = null;
+  /** AUDIT FIX: one-shot notice when the underlying storage write failed
+   *  (quota exceeded / private-mode denial). Consumed exactly once so the UI
+   *  can warn the user instead of silently losing their data on restart. */
+  private writeError: string | null = null;
 
   constructor(store: KeyValueRepository) {
     this.store = store;
@@ -171,6 +175,20 @@ export class LocalStateRepository {
         'Storage was full, so some older memories were compacted to fit. Your progress is safe — only old AI memory notes were trimmed.';
     }
     this.store.setItem(STATE_KEY, serialized);
+    // AUDIT FIX: read the backend's write-failure flag right after the
+    // (synchronous) persist attempt. PersistentStorage.set runs its whole body
+    // synchronously, so the error is already recorded here when a quota/denial
+    // occurred. This is the ONLY production consumer of getLastWriteError.
+    const writeErr = (this.store as { getLastWriteError?: () => string | null }).getLastWriteError?.();
+    if (writeErr) this.writeError = writeErr;
+  }
+
+  /** Returns + clears the pending write-failure notice (one-shot; consumed by
+   *  the UI the same way as the prune notice). */
+  consumeWriteError(): string | null {
+    const err = this.writeError;
+    this.writeError = null;
+    return err;
   }
 
   /** Returns + clears the pending prune notice (one-shot; M7). */
@@ -196,6 +214,8 @@ export class CachedStateStore implements StateStore {
   /** Trailing debounce window for repository writes (ms). */
   private readonly persistDelayMs: number;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** UI listeners notified (asynchronously) on every cache change. */
+  private readonly listeners = new Set<() => void>();
 
   constructor(repo: StateRepository, persistDelayMs = 400) {
     this.repo = repo;
@@ -208,6 +228,27 @@ export class CachedStateStore implements StateStore {
   }
 
   /**
+   * Subscribe to store changes (hang-fix P3): replaces the 100ms polling in
+   * useAppState. Returns an unsubscribe function. Emission is DEFERRED to a
+   * microtask so a save() called from inside a React state updater (e.g.
+   * useAppState.update) can never trigger a setState DURING the render phase.
+   */
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emitChange(): void {
+    const notify = () => {
+      for (const listener of [...this.listeners]) listener();
+    };
+    if (typeof queueMicrotask === 'function') queueMicrotask(notify);
+    else setTimeout(notify, 0);
+  }
+
+  /**
    * Re-reads the repository into the cache and returns the fresh snapshot.
    * Used at boot (repair a pre-init empty read — N1) and whenever external
    * storage may have changed (multi-tab sync, sync restore, backup import —
@@ -215,7 +256,15 @@ export class CachedStateStore implements StateStore {
    * server is invisible to the UI until a full page reload.
    */
   reload(): AppState {
+    // AUDIT FIX (INFO): cancel any pending debounced write. It captured the
+    // PRE-reload state and would fire repo.save(oldState) AFTER the fresh
+    // read, silently clobbering the just-loaded (other-tab/sync-restored) data.
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
     this.cache = this.repo.load();
+    this.emitChange();
     return this.cache;
   }
 
@@ -230,6 +279,7 @@ export class CachedStateStore implements StateStore {
     // debounced write is invisible except that storage catches up ~400ms later
     // (or immediately on flush()/page hide).
     this.cache = state;
+    this.emitChange();
     if (this.persistTimer !== null) clearTimeout(this.persistTimer);
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
@@ -250,5 +300,10 @@ export class CachedStateStore implements StateStore {
   /** One-time notice when the last save had to trim memory (M7). */
   consumePruneNotice(): string | null {
     return this.repo.consumePruneNotice ? this.repo.consumePruneNotice() : null;
+  }
+
+  /** One-time notice when the last persist hit a storage write failure. */
+  consumeWriteError(): string | null {
+    return this.repo.consumeWriteError ? this.repo.consumeWriteError() : null;
   }
 }

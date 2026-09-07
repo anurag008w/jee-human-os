@@ -141,9 +141,9 @@ ACTIONS.register({ id: 'deleteMemory', label: 'Delete memory', description: 'Del
 ACTIONS.register({ id: 'pinMemory', label: 'Pin memory', description: 'Pin entry to long-term memory.', entityType: 'appState', permissions: ['edit'] });
 ACTIONS.register({ id: 'unpinMemory', label: 'Unpin memory', description: 'Unpin entry from long-term memory.', entityType: 'appState', permissions: ['edit'] });
 // Proactive: scheduleMessage / makeCall / scheduleCall / listScheduled / cancelScheduled
-ACTIONS.register({ id: 'scheduleMessage', label: 'Schedule a message', description: 'Misa a future-time message schedule kar sakti hai — user ko yaad dilane ke liye.', entityType: 'appState', permissions: ['edit'] });
-ACTIONS.register({ id: 'makeCall', label: 'Call student now', description: 'Misa abhi user ko ek proactive call kar sakti hai.', entityType: 'appState', permissions: ['edit'] });
-ACTIONS.register({ id: 'scheduleCall', label: 'Schedule a call', description: 'Misa a future-time call schedule kar sakti hai user ke saath.', entityType: 'appState', permissions: ['edit'] });
+ACTIONS.register({ id: 'scheduleMessage', label: 'Schedule a message', description: 'Misa a future-time message schedule kar sakti hai — user ko yaad dilane ke liye.', entityType: 'appState', permissions: ['edit'], confirmationRequired: true });
+ACTIONS.register({ id: 'makeCall', label: 'Call student now', description: 'Misa abhi user ko ek proactive call kar sakti hai.', entityType: 'appState', permissions: ['edit'], confirmationRequired: true });
+ACTIONS.register({ id: 'scheduleCall', label: 'Schedule a call', description: 'Misa a future-time call schedule kar sakti hai user ke saath.', entityType: 'appState', permissions: ['edit'], confirmationRequired: true });
 ACTIONS.register({ id: 'listScheduled', label: 'List scheduled', description: 'Scheduled messages/calls list karo.', entityType: 'appState', permissions: ['read'] });
 ACTIONS.register({ id: 'cancelScheduled', label: 'Cancel scheduled', description: 'A scheduled message/call cancel karo.', entityType: 'appState', permissions: ['delete'] });
 
@@ -831,6 +831,15 @@ export class ChatToolsService {
     };
     this.store.save(nextState);
 
+    // updateTodo can also COMPLETE a to-do — cancel related scheduled reminders
+    // through the same completion event the toggle path uses.
+    if (action.completed === true && !target.completed) {
+      void getProactive().then((svc) => {
+        svc.notifyEntityCompleted('todo', updatedTodo.title);
+        svc.notifyEntityCompleted('keyword', updatedTodo.title);
+      });
+    }
+
     return {
       ok: true,
       summary: `To-Do "${updatedTodo.title}" update ho gaya.\nPriority: ${updatedTodo.priority.toUpperCase()} | Est: ${updatedTodo.estimatedMinutes} min | Category: ${updatedTodo.category || 'general'} | Status: ${updatedTodo.completed ? 'COMPLETED' : 'PENDING'}`,
@@ -988,8 +997,8 @@ export class ChatToolsService {
     // To-Do complete hua — related scheduled reminder auto-cancel karo.
     if (nextCompleted) {
       void getProactive().then((svc) => {
-        svc.cancelScheduledForDoneEntity('todo', target.title);
-        svc.cancelScheduledForDoneEntity('keyword', target.title);
+        svc.notifyEntityCompleted('todo', target.title);
+        svc.notifyEntityCompleted('keyword', target.title);
       });
     }
 
@@ -2045,13 +2054,16 @@ export class ChatToolsService {
 
     // Kaam ho gaya — usse related scheduled reminder auto-cancel karo
     // ("ho gaya" wala scheduled ab dobara na bhejo) — title aur taskId dono.
+    // notifyEntityCompleted is the SINGLE semantic entry for completion events
+    // (it routes to cancelScheduledForDoneEntity), so chat-tools and the
+    // proactive agent stay in sync on what "done" means.
     const completedTitle = this.taskBank.getById(taskId)?.title ?? '';
     void getProactive().then((svc) => {
       if (completedTitle) {
-        svc.cancelScheduledForDoneEntity('task', completedTitle);
-        svc.cancelScheduledForDoneEntity('keyword', completedTitle);
+        svc.notifyEntityCompleted('task', completedTitle);
+        svc.notifyEntityCompleted('keyword', completedTitle);
       }
-      svc.cancelScheduledForDoneEntity('keyword', taskId);
+      svc.notifyEntityCompleted('keyword', taskId);
     });
 
     return { ok: true, versionId: resultAction.versionId, summary: resultAction.summary };

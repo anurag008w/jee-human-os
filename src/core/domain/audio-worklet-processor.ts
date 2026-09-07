@@ -8,13 +8,16 @@
  * "hang".
  *
  * This module is the REAL AudioWorklet engine. It runs on the audio render
- * thread and does everything except the final base64 string:
+ * thread, and since hang-fix P4 it does the WHOLE per-chunk DSP:
  *   - accumulates the mic render quanta (128 frames) into a 2048-sample ring,
  *   - computes RMS,
  *   - downsamples to 16kHz (same average-grouping algorithm as the fallback),
  *   - converts float → 16-bit PCM,
- *   - transfers the PCM buffer to the main thread (base64 encode is trivial on
- *     ~683 samples; the transfer is a zero-copy ownership hand-off).
+ *   - base64-encodes the PCM into the wire-ready string (P4 — this used to be
+ *     built on the MAIN thread, one ~1.3KB string × 23 chunks/sec, on the same
+ *     thread as typing/scrolling/React: a live-call hang + robotic-glitch
+ *     contributor),
+ *   - posts only the string to the main thread, which merely forwards it.
  *
  * AudioWorklet modules must be loaded from a URL, and we don't want a build
  * plugin / public asset dependency for one small class. So the processor is
@@ -32,9 +35,13 @@ export const WORKLET_SOURCE = `
 const MisaAudioProcessor = class extends AudioWorkletProcessor {
   constructor() {
     super();
-    // Ring accumulates 128-frame render quanta up to a full 2048-sample block.
+    // Block = ~40ms of capture (Google Live guidance: 20–40ms input chunks).
+    // Sample-rate-aware so 24k contexts (85ms chunks with the old fixed 2048)
+    // and 44.1k/48k contexts all stay inside the recommended window.
+    this.block = Math.max(640, Math.round(sampleRate * 0.04));
+    // Ring accumulates 128-frame render quanta up to one full block.
     this.ring = new Float32Array(4096);
-    this.out16k = new Float32Array(2048);
+    this.out16k = new Float32Array(this.block + 128);
     this.fill = 0;
   }
 
@@ -43,21 +50,22 @@ const MisaAudioProcessor = class extends AudioWorkletProcessor {
     const ch = input ? input[0] : null;
     if (!ch || ch.length === 0) return true;
 
+    const blockLen = this.block;
     const ring = this.ring;
     let fill = this.fill;
     if (fill + ch.length > ring.length) {
-      // Safety net: shouldn't happen with 128-frame quanta + 2048 threshold.
+      // Safety net: shouldn't happen with 128-frame quanta + block threshold.
       fill = 0;
     }
     ring.set(ch, fill);
     fill += ch.length;
     this.fill = fill;
 
-    // Only emit a chunk once a full block has accumulated (~23 chunks/sec).
-    if (fill < 2048) return true;
+    // Only emit a chunk once a full block has accumulated (~25 chunks/sec).
+    if (fill < blockLen) return true;
 
-    const block = ring.subarray(0, fill);
-    const n = block.length;
+    const n = fill;
+    const block = ring.subarray(0, n);
 
     // RMS (root mean square) amplitude for the live voice meter.
     let sumSq = 0;
@@ -67,8 +75,9 @@ const MisaAudioProcessor = class extends AudioWorkletProcessor {
     // Downsample to 16kHz mono with the same average-grouping used by the
     // ScriptProcessor fallback, so both engines emit numerically-identical PCM.
     const ratio = sampleRate / 16000;
-    const outLen = Math.round(n / ratio);
     const out16k = this.out16k;
+    // Clamp: never write past the scratch even on unusual sample rates.
+    const outLen = Math.min(Math.round(n / ratio), out16k.length - 1);
     let oi = 0;
     let ii = 0;
     while (oi < outLen) {
@@ -96,12 +105,32 @@ const MisaAudioProcessor = class extends AudioWorkletProcessor {
       send[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
 
-    // Zero-copy hand-off: transfer the fresh buffer; the main thread reads
-    // only the used outLen samples.
-    this.port.postMessage(
-      { kind: 'chunk', pcm: send.buffer, outLen: outLen, rms: rms },
-      [send.buffer],
-    );
+    // Hang-fix P4: base64 ENCODE HERE, on the audio render thread, so the main
+    // (UI) thread never builds a string per chunk during a live call. ~683
+    // samples → ~1.3KB string; plain string concatenation is fine at 23/sec.
+    // The main thread now only forwards the ready string to the WebSocket.
+    const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const bytes = new Uint8Array(send.buffer, 0, outLen * 2);
+    let b64 = '';
+    let bi = 0;
+    for (; bi + 2 < bytes.length; bi += 3) {
+      const num = (bytes[bi] << 16) | (bytes[bi + 1] << 8) | bytes[bi + 2];
+      b64 +=
+        B64[(num >> 18) & 63] +
+        B64[(num >> 12) & 63] +
+        B64[(num >> 6) & 63] +
+        B64[num & 63];
+    }
+    const rem = bytes.length - bi;
+    if (rem === 1) {
+      const num = bytes[bi] << 16;
+      b64 += B64[(num >> 18) & 63] + B64[(num >> 12) & 63] + '==';
+    } else if (rem === 2) {
+      const num = (bytes[bi] << 16) | (bytes[bi + 1] << 8);
+      b64 += B64[(num >> 18) & 63] + B64[(num >> 12) & 63] + B64[(num >> 6) & 63] + '=';
+    }
+
+    this.port.postMessage({ kind: 'chunk', b64: b64, outLen: outLen, rms: rms });
     this.fill = 0;
     return true;
   }

@@ -283,15 +283,13 @@ describe('AudioStreamer capture engine', () => {
     expect(addModule).toHaveBeenCalledWith('blob:fake-worklet');
     expect(streamer.getCaptureEngine()).toBe('worklet');
 
-    // The worklet posts a 2048-int16 ring buffer; main reads outLen=683 samples.
-    const pcm = new Int16Array(2048).fill(16383).buffer;
-    fakePort.onmessage!({ data: { kind: 'chunk', pcm, outLen: 683, rms: 0.5 } } as MessageEvent);
+    // P4: the worklet now posts the READY base64 string (no ArrayBuffer transfer),
+    // so a 683-sample (683×2 bytes) 0.5-DC block arrives as exactly that string.
+    const wire = btoa(String.fromCharCode(...Array.from({ length: 683 }, () => 0xff), ...Array.from({ length: 683 }, () => 0x3f)));
+    fakePort.onmessage!({ data: { kind: 'chunk', b64: wire, outLen: 683, rms: 0.5 } } as MessageEvent);
 
     expect(chunks.length).toBe(1);
-    const bytes = Uint8Array.from(atob(chunks[0].b64), (c) => c.charCodeAt(0));
-    expect(bytes.length).toBe(683 * 2);
-    expect(bytes[0]).toBe(0xff);
-    expect(bytes[1]).toBe(0x3f);
+    expect(chunks[0].b64).toBe(wire); // forwarded verbatim, not re-encoded on main
     expect(chunks[0].rms).toBeCloseTo(0.5, 5);
     void streamer;
 

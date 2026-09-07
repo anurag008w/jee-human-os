@@ -1,49 +1,55 @@
 # 🚀 LevelUp — L × Light × JEE
 
-> **A high-performance, offline-first JEE prep system & AI coach (Misa)** packaged as an Android application. Designed for JEE 2026/2027 aspirants to build unstoppable study habits, track mastery, and converse with an intelligent voice coach.
+> **Ek high-performance, offline-first JEE prep system aur AI coach (Misa)** jo Android app ke roop me packaged hai. JEE 2026/2027 aspirants ke liye banaya gaya — study habits banane, mastery track karne, aur ek smart voice coach se baat karne ke liye.
 
 ---
 
 ## ✨ Highlights & Key Features
 
 ### 🎙️ Misa Live Voice & Multimodal AI
-- **Real-Time Bidirectional Voice**: Ultra-low-latency conversational AI with native Audio Worklet streaming.
-- **Stutter-Proof Playback (Jitter Buffer)**: A receiver-side jitter buffer feeds decoded PCM chunks to the hardware on a smooth clock with pre-roll lead + startup/underrun guard — so long replies on weak networks stay silky-smooth with no "cut-cut" clicks.
-- **Smart Notification Batching**: Streaming replies collapse repeated live-notification rebuilds into a single refresh per turn, keeping the main thread free of bridge/IPC churn for uninterrupted audio on low-signal links.
-- **Proactive Silence Companion**: If the call falls quiet, Misa naturally speaks up on her own — ~25s on audio, ~22s in background, ~20s with camera/screen active — with escalating playful friend-like pacing (from a casual check-in to a good-natured "gussa").
-- **Voice Activity Detection (VAD) & Interruptions**: Speak naturally; Misa pauses and listens the moment you talk.
-- **Dynamic Audio Routing**: Seamless switching between device earpiece, speakerphone, wired headphones, and Bluetooth earbuds (`RECORD_AUDIO`, `MODIFY_AUDIO_SETTINGS`, `BLUETOOTH_CONNECT`).
-- **Camera & Vision Understanding**: Snap photos of textbook problems or handwritten equations for instant step-by-step guidance.
-- **Leak-Free Stream Sanitizer**: Built-in control-token scrubber strips BOS/EOS tokens (`<|begin_of_sentence|>`, `<|im_start|>`, etc.) in real time.
+> **⚠️ Development (dev) features** — ye Misa **Live / Memory / Proactive** wali cheezein abhi *production-ready nahi* hain (details niche "Development Status" section me). Inhe production me laane ke liye abhi kaafi mehnat karni hogi.
+
+- **Real-Time Bidirectional Voice** *(dev — live voice abhi under development me hai)*: Ultra-low-latency conversational AI native Audio Worklet streaming ke saath.
+- **Stutter-Proof Playback (Jitter Buffer)**: Ek receiver-side jitter buffer decoded PCM chunks ko hardware pe smooth clock pe feeds karta hai (pre-roll lead + startup/underrun guard ke saath) — taaki weak network pe lambi replies bhi silky-smooth rahe, koi "cut-cut" click nahi.
+- **Smart Notification Batching**: Streaming replies repeated live-notification rebuilds ko ek hi refresh me collapse kar deta hai per turn — main thread bridge/IPC churn se free rehta hai, low-signal links pe audio uninterrupted.
+- **Proactive Silence Companion** *(dev)*: Agar call quiet ho jaye, toh Misa khud bolti hai — audio pe ~25s, background me ~22s, camera/screen active pe ~20s — escalating playful friend-like pacing ke saath (casual check-in se lekar good-natured "gussa" tak).
+- **Voice Activity Detection (VAD) & Interruptions**: Naturally bolo; Misa pause karke sun leti hai jaise hi tum bolte ho.
+- **Dynamic Audio Routing**: Device earpiece, speakerphone, wired headphones, aur Bluetooth earbuds ke beech seamless switching (`RECORD_AUDIO`, `MODIFY_AUDIO_SETTINGS`, `BLUETOOTH_CONNECT`).
+- **Camera & Vision Understanding**: Textbook problems ya handwritten equations ki photos snap karke instant step-by-step guidance lo.
+- **Leak-Free Stream Sanitizer**: Built-in control-token scrubber BOS/EOS tokens (`<|begin_of_sentence|>`, `<|im_start|>`, etc.) ko real time me strip karta hai.
 
 ### 📋 Custom To-Dos & Modern Arrange Mode
-- **Dual Study Tracks**: Switch effortlessly between the structured **90-Day Curriculum** and the **Flexible Daily To-Do Track**.
-- **Intuitive Gestures**: Slide right to delete, slide left to edit, and tap to mark tasks as completed.
-- **Modern Arrange Mode**: Reorder your daily priorities with smooth drag-and-drop or one-tap chevron buttons (`↑` / `↓`).
-- **Granular Tagging**: Priority pills (High, Med, Low), estimated durations (15m to 90m), and subject filters (Physics, Chemistry, Maths, Revision, General).
-- **Safety Confirmations**: Uncompleting a finished task prompts an instant confirmation dialog to prevent accidental clicks.
+- **Dual Study Tracks**: Structured **90-Day Curriculum** aur **Flexible Daily To-Do Track** ke beech effortlessly switch karo.
+- **Intuitive Gestures**: Slide right = delete, slide left = edit, tap = task complete karna.
+- **Modern Arrange Mode**: Daily priorities ko smooth drag-and-drop ya one-tap chevron buttons (`↑` / `↓`) se reorder karo.
+- **Granular Tagging**: Priority pills (High, Med, Low), estimated durations (15m to 90m), aur subject filters (Physics, Chemistry, Maths, Revision, General).
+- **Safety Confirmations**: Finished task ko uncomplete karna accidental clicks se bachane ke liye instant confirmation dialog maangta hai.
 
 ### 🤖 Autonomous AI Tools & Plan Manager
-- **Function Calling**: Misa can create, edit, reschedule, and delete tasks directly on your device.
-- **Safety-First Flow**: Destructive actions (like bulk deletions or schedule overwrites) require explicit confirmation before execution.
-- **Transparent Status Badges**: Tool execution states show exact details (`✅ Success`, `⏳ Approval Needed`, `❌ Failed`).
+> **⚠️ Development (dev) features** — Autonomous tools, **Misa Memory** aur **Proactive Message/Call** flows abhi *production-ready nahi* (details niche "Development Status" section me).
+
+- **Function Calling**: Misa tasks ko directly device pe create/edit/reschedule/delete kar sakta hai.
+- **Safety-First Flow**: Destructive actions (jaise bulk deletions ya schedule overwrites) execute hone se pehle explicit confirmation maangte hain.
+- **Transparent Status Badges**: Tool execution states exact details dikhate hain (`✅ Success`, `⏳ Approval Needed`, `❌ Failed`).
+- **Proactive Study Nudges** *(dev — in development)*: Misa spontaneously check-in karti hai, aapke study struggles pe follow-up karti hai, aur momentum banaye rakhti hai — bina kisi ne type kiye bhi proactively message karti hai.
+- **Proactive Incoming Live Calls** *(dev — in development)*: Misa scheduled study checks ke liye live call kar sakti hai (WhatsApp-style) — ye proactive calls abhi development me hain aur production-ready nahi.
 
 ### 📦 In-App Modular APK Updates
-- **Automatic Version Detection**: Checks GitHub Releases for signed APKs with semantic/date tag comparisons.
-- **Download & Install (1-Click)**: Streams APK in chunks with live byte-level progress and immediately opens the system package installer.
-- **Download Only Mode**: Downloads and caches the APK without forcing an instant installer popup.
-- **Storage Transparency & Share**: Displays the exact file location (`updates/levelup.apk`) with options to install, share to Google Drive/Downloads/WhatsApp via native share sheet, or delete cached files.
-- **Android 8.0 to Android 15+ Compatibility**: Fully configured with `REQUEST_INSTALL_PACKAGES` and FileProvider content URIs.
+- **Automatic Version Detection**: GitHub Releases me signed APKs semantic/date tag comparisons se check karta hai.
+- **Download & Install (1-Click)**: APK chunks me stream hota hai with live byte-level progress, phir system package installer turant khulta hai.
+- **Download Only Mode**: APK ko install popup force kiye bina download & cache karta hai.
+- **Storage Transparency & Share**: Exact file location (`updates/levelup.apk`) display karta hai — install/share (Google Drive/Downloads/WhatsApp native share sheet se) ya delete cached files.
+- **Android 8.0 to Android 15+ Compatibility**: `REQUEST_INSTALL_PACKAGES` aur FileProvider content URIs ke saath fully configured.
 
 ### 🎯 90-Day Habit Engine & Exam Month Protocol
-- **30 Levels Across 4 Phases**: Systematic habit progression covering deep work, morning routines, error logging, and revision cycles.
-- **Mastery Placement**: Automatically groups mastered tasks into permanent completed vaults while allowing flexible re-scheduling.
-- **Recovery Mode**: Automatically activates if daily completion drops below 30% to rebuild momentum with essential core tasks.
-- **Exam Month Mode**: Auto-triggers 30 days before your JEE Main attempt date, switching the daily focus to revision and mock test analysis.
+- **30 Levels Across 4 Phases**: Systematic habit progression — deep work, morning routines, error logging, aur revision cycles.
+- **Mastery Placement**: Mastered tasks automatically permanent completed vaults me group ho jate hain, flexible re-scheduling allow karte hue.
+- **Recovery Mode**: Daily completion 30% se niche girne pe automatically activate hota hai — essential core tasks se momentum rebuild karne ke liye.
+- **Exam Month Mode**: JEE Main attempt date se 30 days pehle auto-trigger — revision aur mock test analysis pe focus switch karta hai.
 
 ### 🌐 Multi-Provider Architecture
-- **Google Gemini API**: Direct support for Gemini 2.0 Flash, Gemini 1.5 Pro, and multimodal live sessions.
-- **SmartRotator & OpenAI-Compatible Endpoints**: Custom proxy and fallback support with auto-rotating keys and resilient retry loops.
+- **Google Gemini API**: Direct support Gemini 2.0 Flash, Gemini 1.5 Pro, aur multimodal live sessions ke liye.
+- **SmartRotator & OpenAI-Compatible Endpoints**: Custom proxy aur fallback support, auto-rotating keys aur resilient retry loops ke saath.
 
 ---
 
@@ -52,8 +58,8 @@
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS, Framer Motion, Lucide Icons.
 - **Native Runtime**: Capacitor 8 (Filesystem, Local Notifications, Intent Launcher, Share, App, Device).
 - **Math & Markdown**: KaTeX (inline & display LaTeX math), Rehype/Remark GFM, Highlight.js.
-- **State & Storage**: Offline-first LocalStorage & IndexedDB with optimistic UI updates and reactive listeners.
-- **Testing & Quality**: Vitest, React Testing Library, Oxlint (94 test suites / 1,100+ tests). Live audio, silence-proactive, and jitter-buffer streaming pipelines are covered by dedicated suites.
+- **State & Storage**: Offline-first LocalStorage & IndexedDB with optimistic UI updates aur reactive listeners.
+- **Testing & Quality**: Vitest, React Testing Library, Oxlint (94 test suites / 1,100+ tests). Live audio, silence-proactive, aur jitter-buffer streaming pipelines dedicated suites se covered hain.
 
 ---
 
@@ -61,7 +67,7 @@
 
 ### Prerequisites
 - Node.js 20+ & npm
-- Android Studio / Android SDK (for native builds)
+- Android Studio / Android SDK (native builds ke liye)
 - Java JDK 21
 
 ### 1. Clone & Install Dependencies
@@ -78,48 +84,68 @@ npm run dev
 
 ### 3. Run Linter & Tests
 ```bash
-# Run ultra-fast oxlint
+# Ultra-fast oxlint chalao
 npm run lint
 
-# Run all 94 test suites (1,100+ tests)
+# Saare 94 test suites chalao (1,100+ tests)
 npm test
 ```
 
 ### 4. Build & Sync to Android
 ```bash
-# Build production web bundle
+# Production web bundle banao
 npm run build
 
-# Sync web assets and plugins to Android project
+# Web assets aur plugins ko Android project me sync karo
 npx cap sync android
 ```
 
 ### 5. Build Native APK
-Open the `android/` directory in Android Studio, or build via Gradle:
+`android/` directory Android Studio me kholo, ya Gradle se build karo:
 ```bash
 cd android
 ./gradlew assembleDebug
 ```
-The output APK will be located at:
+Output APK yahan milega:
 `android/app/build/outputs/apk/debug/app-debug.apk`
+
+---
+
+## 🧪 Development Status — Misa (Live / Memory / Proactive)
+
+Neeche diye **Misa** features abhi **development (dev)** me hain aur **production-ready nahi**
+maane jane chahiye. Ye app me kaam karte hain, lekin inhe stable, hardened production state me
+laane ke liye abhi kaafi kaam baaki hai — edge cases, error resilience, "no-answer" handling,
+obsolescence, aur long-run stability.
+
+| Feature | Area | Status |
+| --- | --- | --- |
+| **Misa Live voice** | Real-time bidirectional voice + multimodal streaming | 🟡 In development — app me stable, production hardening baaki hai |
+| **Misa Memory** | Conversation/context memory across sessions | 🟡 In development — persistence kaam karta hai, long-run tuning chahiye |
+| **Proactive study nudges (messages)** | Spontaneous auto check-ins & follow-ups | 🟡 In development — scheduling logic, quiet-hours/feedback tuning chahiye |
+| **Proactive WhatsApp-style calls** | Live incoming calls for scheduled checks | 🟡 In development — call flow works, noise/reliability hardening chahiye |
+
+> Ye features **fully functional** hain aur aaj hi usable hain, lekin dev flag isliye lagaya hai
+> kyunki production scale pe abhi battle-tested nahi hain. High-stakes production environment me
+> rely karne se pehle ensure kar lo.
 
 ---
 
 ## 🔐 Android Permissions Overview
 
-The app requests permissions strictly for offline functionality and user-selected AI features:
-- `android.permission.INTERNET`: For AI chat, web search, and GitHub APK updates.
-- `android.permission.RECORD_AUDIO`: For real-time Misa voice chat and audio streaming.
-- `android.permission.CAMERA`: For scanning textbook questions and OCR analysis.
-- `android.permission.MODIFY_AUDIO_SETTINGS` & `BLUETOOTH_CONNECT`: For speaker, headset, and Bluetooth earbuds audio routing.
-- `android.permission.REQUEST_INSTALL_PACKAGES`: For seamless in-app APK updates.
-- `android.permission.POST_NOTIFICATIONS` & `RECEIVE_BOOT_COMPLETED`: For daily mission reminders and study alarms.
-- `android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`: To keep live audio streaming uninterrupted in background sessions.
+App permissions strictly offline functionality aur user-selected AI features ke liye maangta hai:
+- `android.permission.INTERNET`: AI chat, web search, aur GitHub APK updates ke liye.
+- `android.permission.RECORD_AUDIO`: Real-time Misa voice chat aur audio streaming ke liye.
+- `android.permission.CAMERA`: Textbook questions scan karne aur OCR analysis ke liye.
+- `android.permission.MODIFY_AUDIO_SETTINGS` & `BLUETOOTH_CONNECT`: Speaker, headset, aur Bluetooth earbuds audio routing ke liye.
+- `android.permission.REQUEST_INSTALL_PACKAGES`: Seamless in-app APK updates ke liye.
+- `android.permission.POST_NOTIFICATIONS` & `RECEIVE_BOOT_COMPLETED`: Daily mission reminders aur study alarms ke liye.
+- `android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`: Background sessions me live audio streaming uninterrupted rakhne ke liye.
 
 ---
 
 ## 🤝 Contribution & License
 
-Contributions are welcome! Please ensure all code passes `npm run lint` and `npm test` before submitting pull requests.
+Contributions welcome hain! Ensure karo ki saara code `npm run lint` aur `npm test` pass kare PR submit karne se pehle.
 
 Released under the **MIT License**.

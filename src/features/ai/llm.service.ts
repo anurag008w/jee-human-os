@@ -69,7 +69,11 @@ export class LLMService {
     if (!model) throw new ProviderError(providerId, 'bad-request', 'selected provider has no model configured');
     const chain: ChainEntry[] = [];
     const fallback = !requestedModel && config.fallbackModel && config.fallbackModel !== model ? config.fallbackModel : null;
-    for (const m of fallback ? [fallback, model] : [model]) chain.push({ config, model: m });
+    // AUDIT FIX (round 1, MEDIUM): the configured/requested model is PRIMARY —
+    // it must be tried FIRST and the fallback model only after it fails.
+    // Before this, a healthy primary was never tried when a (weaker) fallback
+    // was configured, so users silently rode the fallback model.
+    for (const m of fallback ? [model, fallback] : [model]) chain.push({ config, model: m });
     return chain;
   }
 
@@ -84,7 +88,9 @@ export class LLMService {
       const model = config.model;
       if (!model) continue;
       const fallback = config.fallbackModel && config.fallbackModel !== model ? config.fallbackModel : null;
-      const candidates = fallback ? [fallback, model] : [model];
+      // AUDIT FIX: primary model first, fallback only after it fails (same
+      // rationale as buildProviderChain).
+      const candidates = fallback ? [model, fallback] : [model];
       for (const m of candidates) {
         const key = `${config.id}:${m}`;
         if (seen.has(key)) continue;

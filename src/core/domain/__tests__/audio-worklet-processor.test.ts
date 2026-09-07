@@ -101,32 +101,34 @@ describe('MisaAudioProcessor worklet source', () => {
     expect(name).toBe(WORKLET_PROCESSOR_NAME);
   });
 
-  it('accumulates render quanta and emits ONE 16k PCM chunk per 2048 input frames', () => {
+  it('accumulates render quanta and emits ONE 16k PCM chunk per ~40ms block', () => {
     const { Processor, posts } = loadWorkletClass(48000);
-    pump(Processor, 128, 2048, 0.5);
+    // 48000 * 0.04s = 1920 frames per block.
+    pump(Processor, 128, 1920, 0.5);
     expect(posts).toHaveBeenCalledTimes(1);
     const msg = posts.mock.calls[0][0];
     expect(msg.kind).toBe('chunk');
-    // 2048 @48kHz → 683 samples @16kHz.
-    expect(msg.outLen).toBe(683);
+    // 1920 @48kHz → 640 samples @16kHz (≈40ms input chunk, Google guidance).
+    expect(msg.outLen).toBe(640);
     expect(msg.rms).toBeCloseTo(0.5, 5);
-    // Transferred buffer is the (ring-sized) PCM ArrayBuffer.
-    expect(msg.pcm).toBeInstanceOf(ArrayBuffer);
-    const transfer = posts.mock.calls[0][1];
-    expect(transfer).toContain(msg.pcm);
+    // Hang-fix P4: the worklet posts the READY base64 string — never a raw
+    // ArrayBuffer, and no transfer list (strings are cloneable by value).
+    expect(typeof msg.b64).toBe('string');
+    expect(msg.pcm).toBeUndefined();
+    expect(posts.mock.calls[0][1]).toBeUndefined();
   });
 
   it('does not emit before a full block accumulates', () => {
     const { Processor, posts } = loadWorkletClass(48000);
-    pump(Processor, 128, 2048 - 128, 0.3); // 15 quanta < 2048 threshold
+    pump(Processor, 128, 1920 - 128, 0.3); // 14 quanta < 1920 threshold
     expect(posts).not.toHaveBeenCalled();
   });
 
   it('emits identical little-endian PCM as the ScriptProcessor fallback encoder', () => {
     const { Processor, posts } = loadWorkletClass(48000);
-    pump(Processor, 128, 2048, 0.5);
+    pump(Processor, 128, 1920, 0.5);
     const msg = posts.mock.calls[0][0];
-    const bytes = new Uint8Array(msg.pcm, 0, msg.outLen * 2);
+    const bytes = Uint8Array.from(atob(msg.b64), (c) => c.charCodeAt(0));
     // float 0.5 → 0.5 * 0x7fff = 16383 (0x3FFF), little-endian [0xFF, 0x3F].
     expect(bytes[0]).toBe(0xff);
     expect(bytes[1]).toBe(0x3f);
@@ -136,38 +138,36 @@ describe('MisaAudioProcessor worklet source', () => {
     }
   });
 
-  it('re-arms a FRESH buffer per chunk — a reused transferred buffer throws DataCloneError (real MessagePort)', async () => {
-    // Two full 2048-frame blocks → two postMessage transfers. The browser
-    // detaches the transferred ArrayBuffer; the old code kept writing+sending
-    // the same reusable PCM array and the SECOND transfer threw
-    // "DataCloneError: ArrayBuffer at index 0 is already detached".
+  it('posts cloneable b64 strings over a REAL MessagePort — every chunk intact, no DataCloneError', async () => {
+    // Two full ~40ms blocks → two postMessage calls. With the old
+    // ArrayBuffer-transfer contract the browser DETACHED the transferred
+    // buffer and a reused PCM array threw "DataCloneError" on the second
+    // chunk. P4 posts strings (cloneable by value) — no transfer list, so the
+    // receiver must get two fully intact, identical 640-sample chunks.
     const { Processor, posts, received } = loadWorkletClass(48000, true);
     const inst = new Processor();
     for (let block = 0; block < 2; block++) {
-      for (let q = 0; q < 16; q++) {
+      for (let q = 0; q < 15; q++) {
         inst.process([[new Float32Array(128).fill(0.5)]]);
       }
     }
     expect(posts).toHaveBeenCalledTimes(2);
-    // The recorded (sender-side) buffers are both detached by real transfers,
-    // but they must be DIFFERENT ArrayBuffer objects — never a reused one.
-    expect(posts.mock.calls[1][0].pcm).not.toBe(posts.mock.calls[0][0].pcm);
-    // The receiving end sees two fully intact 683-sample PCM chunks.
+    expect(posts.mock.calls[0][1]).toBeUndefined(); // no transfer list at all
     const msgs = await received();
     expect(msgs).toHaveLength(2);
-    expect(msgs[1].pcm.byteLength).toBe(683 * 2);
-    const bytes = new Uint8Array(msgs[1].pcm);
+    const bytes = Uint8Array.from(atob(msgs[1].b64), (c) => c.charCodeAt(0));
+    expect(bytes).toHaveLength(640 * 2);
     expect(bytes[0]).toBe(0xff);
     expect(bytes[1]).toBe(0x3f);
   });
 
   it('downsamples non-48k contexts by the same average-grouping rule', () => {
     const { Processor, posts } = loadWorkletClass(44100);
-    pump(Processor, 128, 2048, 0.5);
+    // 44100 * 0.04s = 1764 → round(1764 / (44100/16000)) = round(640) = 640.
+    pump(Processor, 128, 1764, 0.5);
     expect(posts).toHaveBeenCalledTimes(1);
     const msg = posts.mock.calls[0][0];
-    // 2048 @44.1kHz → round(2048 / (44100/16000)) = round(743.2) = 743.
-    expect(msg.outLen).toBe(743);
+    expect(msg.outLen).toBe(640);
   });
 
   it('silently survives an empty input quantum', () => {

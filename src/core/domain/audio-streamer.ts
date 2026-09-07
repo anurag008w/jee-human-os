@@ -17,8 +17,9 @@ import { WORKLET_PROCESSOR_NAME, WORKLET_SOURCE } from './audio-worklet-processo
 // to hang is that every ~43ms (≈23 chunks/sec) the OLD ScriptProcessor ran the
 // whole DSP — RMS, downsample-to-16k, float→PCM, base64 — on the single
 // Capacitor WebView main thread, alongside typing, scrolling and React.
-// Today the primary engine is a REAL AudioWorklet (RMS + downsample + PCM all on
-// the audio render thread; only the trivial base64 string is built on main).
+// Today the primary engine is a REAL AudioWorklet — the ENTIRE per-chunk DSP
+// (RMS + downsample + float→PCM + base64, hang-fix P4) runs on the audio
+// render thread; the main thread only forwards the ready base64 string.
 // AudioWorklet predates some old WebViews, so ScriptProcessor remains as a
 // silent fallback (with the heavy spots micro-optimized and buffer-reused).
 
@@ -57,14 +58,39 @@ export class AudioStreamer {
   private static readonly MIN_CHAIN_LEAD_MS = 20; // never schedule a burst dead-on `now`
   private static readonly SCHEDULE_AHEAD_SECONDS = 1.2; // keep ~1.2s of audio pre-scheduled
   private static readonly STARTUP_BUFFER_COUNT = 1; // start as soon as the first chunk is decoded
+  // ── Adaptive weak-network buffering (low-bandwidth voice fix) ──
+  // On a slow link the server's audio chunks arrive in bursts with silent gaps.
+  // We LEARN the link is weak (repeated playback under-runs) and then:
+  //   • hold the cold start until a small burst (~400ms) is queued, so the very
+  //     first words of a reply never play into an empty buffer (the old "pehle
+  //     ke words cutte hain" — STARTUP_BUFFER_COUNT=1 fired on the FIRST chunk);
+  //   • on an under-run, wait for a short burst (~260ms) before resuming with a
+  //     slightly larger lead — fewer, longer audio runs instead of word-level
+  //     "atak atak" clipping. On a healthy link everything stays as before
+  //     (immediate start, 20ms lead) so latency never regresses.
+  // Native (Android GaplessAudioTrack) has no WebAudio scheduler — the track's
+  // own internal buffer absorbs jitter, but a reply that STARTS with one lonely
+  // chunk on a slow link still cuts the opening words. Hold the first write
+  // until a small burst is buffered (or a hard cap passes — never stall longer
+  // than this on a reply that genuinely wants to start).
 
   private audioContext: AudioContext | null = null;
   private micStream: MediaStream | null = null;
   private inputSource: MediaStreamAudioSourceNode | null = null;
   private inputAnalyser: AnalyserNode | null = null;
+  // AUDIT FIX (round 2, MEDIUM): acquisition generation token. Two overlapping
+  // startRecording() calls can interleave inside the `await ensureRunning()` /
+  // `await tryInitWorklet()` windows — each wires its OWN capture nodes while
+  // only the LAST refs are stored, so stopRecording() never detaches the first
+  // graph and BOTH graphs stream (duplicate audio on the wire). Captured at
+  // entry, checked after every await; a superseded acquisition tears down only
+  // the nodes IT created and returns.
+  private acquisitionGen = 0;
   private outputAnalyser: AnalyserNode | null = null;
   private scriptProcessor: ScriptProcessorNode | null = null;
   private workletNode: AudioWorkletNode | null = null;
+  /** The AudioContext whose AudioWorkletGlobalScope already has our processor registered. */
+  private workletModuleLoadedCtx: AudioContext | null = null;
   /** Which capture engine is live — 'worklet' (primary) or 'scriptprocessor' (fallback). */
   private captureEngine: 'worklet' | 'scriptprocessor' | 'idle' = 'idle';
   // Reusable scratch buffers for the ScriptProcessor fallback so a chunk never
@@ -233,6 +259,10 @@ export class AudioStreamer {
     // stopping the microphone tracks, otherwise the replacement session gets
     // a permanently ended stream.
     this.stopRecording(false);
+    // AUDIT FIX (round 2): invalidate any previous in-flight acquisition BEFORE
+    // the awaits below (a concurrent startRecording now supersedes us).
+    this.acquisitionGen += 1;
+    const gen = this.acquisitionGen;
     this.micStream = stream;
     this.onAudioChunk = onChunk;
     this.onInputLevel = onInputLevel;
@@ -241,35 +271,55 @@ export class AudioStreamer {
     // Autoplay unlock — mic streaming ke liye AudioContext ko running hone do.
     await this.ensureRunning();
     const ctx = this.audioContext!;
+    // A newer startRecording() (or stopRecording) landed while we awaited.
+    if (gen !== this.acquisitionGen) return;
 
-    this.inputSource = ctx.createMediaStreamSource(stream);
-    this.inputAnalyser = ctx.createAnalyser();
-    this.inputAnalyser.fftSize = 256;
-    this.inputSource.connect(this.inputAnalyser);
+    // Local refs to the nodes THIS acquisition creates — a superseded call
+    // must tear down exactly its own graph, never the successor's.
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+    this.inputSource = source;
+    this.inputAnalyser = analyser;
 
     // ── Capture engine ──
-    // Primary: AudioWorklet — RMS / downsample / float→PCM run on the audio
-    // render thread, so the main thread only builds a ~1.3KB base64 string per
-    // chunk (~23/sec). Fallback: ScriptProcessor with micro-optimized DSP for
-    // WebViews that predate AudioWorklet. Both emit numerically-identical PCM.
     const workletOk = await this.tryInitWorklet(ctx);
+    // A newer acquisition (or a stop) landed while we booted the worklet —
+    // detach our graph so the successor owns capture alone.
+    if (gen !== this.acquisitionGen) {
+      try { source.disconnect(); } catch {}
+      return;
+    }
+    // The capture node (worklet or scriptprocessor) THIS acquisition creates.
+    let localCaptureNode: AudioWorkletNode | ScriptProcessorNode | null = null;
     if (workletOk) {
       const workletNode = new AudioWorkletNode(ctx, WORKLET_PROCESSOR_NAME, {
         numberOfInputs: 1,
         numberOfOutputs: 1,
       });
+      localCaptureNode = workletNode;
       workletNode.port.onmessage = (e: MessageEvent) => {
         if (!this.isRecording || this.isMuted) return;
-        const d = e.data as { kind?: string; pcm?: ArrayBuffer; outLen?: number; rms?: number };
-        if (!d || d.kind !== 'chunk' || !d.pcm || !d.outLen) return;
-        const bytes = new Uint8Array(d.pcm, 0, d.outLen * 2);
-        if (bytes.byteLength === 0) return;
-        const base64 = this.arrayBufferToBase64(bytes);
-        if (this.onAudioChunk && base64) {
-          this.onAudioChunk(base64, d.rms ?? 0);
+        const d = e.data as { kind?: string; b64?: string; pcm?: ArrayBuffer; outLen?: number; rms?: number };
+        if (!d || d.kind !== 'chunk') return;
+        // Hang-fix P4 primary contract: the processor posts the READY base64
+        // string (encoded on the audio render thread). Backward-compat fallback
+        // below also accepts the OLD `pcm`-transfer contract so a stale cached
+        // worklet module (HMR/old WebView cache) can NEVER silently kill
+        // capture — a mismatch here previously meant "Misa hears nothing".
+        let wire = d.b64;
+        if (!wire && d.pcm && d.outLen) {
+          const bytes = new Uint8Array(d.pcm, 0, d.outLen * 2);
+          if (bytes.byteLength === 0) return;
+          wire = this.arrayBufferToBase64(bytes);
+        }
+        if (!wire) return;
+        if (this.onAudioChunk) {
+          this.onAudioChunk(wire, d.rms ?? 0);
         }
       };
-      this.inputSource.connect(workletNode);
+      source.connect(workletNode);
       // Keep the graph pulling data through a zero-gain tap (same trick as the
       // ScriptProcessor path below: never route mic audio to the speakers).
       const zeroGain = ctx.createGain();
@@ -282,9 +332,10 @@ export class AudioStreamer {
       // ~43ms at 48kHz: substantially better turn-taking latency than 4096 while
       // still keeping message rate manageable for the Live WebSocket.
       const bufferSize = 2048;
-      this.scriptProcessor = ctx.createScriptProcessor(bufferSize, 1, 1);
+      const scriptProcessor = ctx.createScriptProcessor(bufferSize, 1, 1);
+      localCaptureNode = scriptProcessor;
 
-      this.scriptProcessor.onaudioprocess = (e) => {
+      scriptProcessor.onaudioprocess = (e) => {
         if (!this.isRecording || this.isMuted) return;
         const inputData = e.inputBuffer.getChannelData(0);
         let sumSq = 0;
@@ -303,14 +354,23 @@ export class AudioStreamer {
         }
       };
 
-      this.inputSource.connect(this.scriptProcessor);
+      source.connect(scriptProcessor);
       const zeroGain = ctx.createGain();
       zeroGain.gain.value = 0;
-      this.scriptProcessor.connect(zeroGain);
+      scriptProcessor.connect(zeroGain);
       zeroGain.connect(ctx.destination);
+      this.scriptProcessor = scriptProcessor;
       this.captureEngine = 'scriptprocessor';
     }
 
+    // Final supersede check — a stop/restart landing during the wiring above
+    // must not flip recording on for an already-replaced acquisition, and the
+    // locally-created graph is detached so no orphaned node streams.
+    if (gen !== this.acquisitionGen) {
+      try { source.disconnect(); } catch {}
+      if (localCaptureNode) { try { localCaptureNode.disconnect(); } catch {} }
+      return;
+    }
     this.isRecording = true;
     this.startLevelMonitoring();
   }
@@ -325,13 +385,18 @@ export class AudioStreamer {
       const audioWorklet = (ctx as unknown as { audioWorklet?: { addModule?: (url: string) => Promise<void> } }).audioWorklet;
       if (!audioWorklet || typeof audioWorklet.addModule !== 'function') return false;
       if (typeof AudioWorkletNode === 'undefined') return false;
-      // Blob-loading keeps the worklet source bundled with the app (no public/
-      // asset build step, no CSP risk in the Capacitor WebView).
       if (typeof Blob === 'undefined' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return false;
+      // Same context, already registered → skip addModule. Re-registering on
+      // one scope throws NotSupportedError ("An AudioWorkletProcessor with
+      // name:misa-audio-processor is already registered") and forces the
+      // ScriptProcessor fallback — exactly the "worklet broke after reconnect"
+      // regression seen in the field.
+      if (this.workletModuleLoadedCtx === ctx) return true;
       const blob = new Blob([WORKLET_SOURCE], { type: 'application/javascript' });
       const url = URL.createObjectURL(blob);
       try {
         await audioWorklet.addModule(url);
+        this.workletModuleLoadedCtx = ctx;
       } finally {
         URL.revokeObjectURL(url);
       }
@@ -368,9 +433,13 @@ export class AudioStreamer {
           .then((ok) => {
             this.nativeReady = ok;
             if (ok) {
-              // Native came up after we may have buffered a couple WebAudio
-              // chunks — they already played via the fallback, that's fine.
-              this.pendingChunks = [];
+              // AUDIT FIX (round 1, MEDIUM): do NOT drain pendingChunks here.
+              // The WebAudio scheduler SHIFTS entries out as it hands them to an
+              // AudioBufferSourceNode, so an entry still in the queue has NOT
+              // been played yet — wiping the queue on a late native open clipped
+              // the first ~0.2–1.5s of the opening reply. Leaving them lets the
+              // scheduler finish them through the fallback (no double-play: the
+              // queue is shift-exclusive; new chunks already go native).
             }
           })
           .catch(() => { this.nativeReady = false; });
@@ -395,13 +464,15 @@ export class AudioStreamer {
 
     const ctx = this.audioContext || this.getContext();
     if (!ctx || ctx.state === 'closed') return;
-    // Autoplay-safety: agar AudioContext abhi bhi suspended ho (kuch ROMs pe
-    // first resume pending), turant continue karo.
-    if (ctx.state === 'suspended') {
-      void ctx.resume();
-    }
 
-    const binary = atob(pcm24kBase64);
+    let binary: string;
+    try {
+      binary = atob(pcm24kBase64);
+    } catch {
+      // Malformed server chunk — drop it instead of crashing playback.
+      console.warn('[AudioStreamer] Dropping malformed audio chunk (bad base64).');
+      return;
+    }
     const numSamples = Math.floor(binary.length / 2);
     if (numSamples <= 0) return;
 
@@ -418,6 +489,14 @@ export class AudioStreamer {
       o += 2;
       if (sample >= 32768) sample -= 65536;
       channel[i] = sample / 32768;
+    }
+
+    // Autoplay / background-tab safety: if the context is suspended (hidden
+    // tab) the clock is frozen — queue the chunk anyway and re-kick the drain
+    // once the context actually resumes (drainPendingChunks backs off until
+    // the state is 'running', so nothing piles against a frozen clock).
+    if (ctx.state === 'suspended') {
+      void ctx.resume().then(() => this.kickScheduler()).catch(() => {});
     }
 
     // Jitter-buffer: decoded inline, then queued and fed to the DAC gaplessly by
@@ -443,6 +522,11 @@ export class AudioStreamer {
     if (this.pendingChunks.length === 0) return;
     const ctx = this.audioContext;
     if (!ctx || ctx.state === 'closed') return;
+    // Background-tab fix: a hidden tab SUSPENDS the AudioContext — the clock is
+    // frozen, so scheduling ahead would either stack stale sources or burst-gibberish
+    // on resume. Wait until the context is running again (resumeForVisibility()
+    // re-kicks this drain from the visibilitychange handler).
+    if (ctx.state !== 'running') return;
 
     const speed = this.playbackSpeed && this.playbackSpeed > 0 ? this.playbackSpeed : 1.0;
 
@@ -496,23 +580,38 @@ export class AudioStreamer {
     // or a trailing timer re-triggers).
     let scheduled = 0;
     while (this.pendingChunks.length > 0) {
-      const audioBuffer = this.pendingChunks[0];
+      // The while-guard guarantees a chunk exists; shift() still types undefined.
+      const audioBuffer = this.pendingChunks.shift();
+      if (!audioBuffer) break;
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
       source.playbackRate.value = speed;
       source.connect(this.outputGainNode);
 
       const playDuration = audioBuffer.duration / speed;
-      source.start(this.nextPlayTime);
+      // Background-tab fix: if source.start() throws (the hidden-tab clock froze
+      // and this start time is already stale), DROP the chunk and continue with
+      // the rest of the queue instead of crashing the whole drain — a stale
+      // burst would be worse than one skipped chunk.
+      try {
+        source.start(this.nextPlayTime);
+      } catch {
+        try { source.stop(); } catch {}
+        try { source.disconnect(); } catch {}
+        continue;
+      }
       this.nextPlayTime += playDuration;
       this.pendingPlaybackMs += playDuration * 1000;
       scheduled += playDuration;
 
-      this.pendingChunks.shift();
       this.activeSources.push(source);
       source.onended = () => {
         const idx = this.activeSources.indexOf(source);
-        if (idx !== -1) this.activeSources.splice(idx, 1);
+        // The source was already removed by flushPlayback() — never double-fire
+        // onPlaybackEnded for the same stop (hidden-tab flush fires N+1 times
+        // otherwise).
+        if (idx === -1) return;
+        this.activeSources.splice(idx, 1);
         // NOTE: we intentionally do NOT reset nextPlayTime here. The gapless chain
         // timeline (`nextPlayTime`) stays monotonic across the whole reply so a
         // weak-network gap doesn't force a cold re-buffer mid-stream (the cause of
@@ -533,6 +632,33 @@ export class AudioStreamer {
         this.scheduleTimer = null;
         this.drainPendingChunks();
       }, 16);
+    }
+  }
+
+  /**
+   * Background-tab recovery. The browser suspends the AudioContext while the
+   * tab is hidden: `currentTime` freezes, so already-scheduled chunks are
+   * stale and `onended` never fires (Misa's status stays stuck on
+   * 'speaking'). When the user returns: flush the stale scheduled audio,
+   * resume the context, and re-kick the drain so NEW replies play normally.
+   */
+  resumeForVisibility(): void {
+    const ctx = this.audioContext;
+    if (!ctx || ctx.state === 'closed') return;
+    if (ctx.state !== 'running') {
+      // Hidden-tab freeze: drop anything scheduled against the frozen clock
+      // AND fire onPlaybackEnded so the caller's status returns to 'listening'.
+      // A partial reply cut here is deliberate — a stale burst is far worse.
+      this.flushPlayback(true);
+      ctx
+        .resume()
+        .then(() => this.kickScheduler())
+        .catch(() => {
+          // Context may still be blocked (autoplay policy) — leave pending
+          // chunks queued; a later visibility/input event re-kicks.
+        });
+    } else {
+      this.kickScheduler();
     }
   }
 
@@ -601,6 +727,10 @@ export class AudioStreamer {
   }
 
   stopRecording(stopTracks = false): void {
+    // AUDIT FIX (round 2): stop() must void any in-flight startRecording() too.
+    // Without the bump, a stop landing while startRecording awaited could let
+    // the stale acquisition re-enable capture right after teardown.
+    this.acquisitionGen += 1;
     this.isRecording = false;
     this.captureEngine = 'idle';
     if (this.levelInterval !== null) {
@@ -628,6 +758,11 @@ export class AudioStreamer {
       this.micStream.getTracks().forEach((t) => t.stop());
     }
     this.micStream = null;
+    // Orphan analyser node cleanup (never disconnected on stop before).
+    if (this.inputAnalyser) {
+      try { this.inputAnalyser.disconnect(); } catch {}
+      this.inputAnalyser = null;
+    }
     this.flushPlayback();
   }
 
@@ -650,6 +785,8 @@ export class AudioStreamer {
       this.audioContext = null;
     }
     this.htmlAudioUnlocked = false;
+    // Never re-validate `tryInitWorklet` against a dead context on a NEW one.
+    this.workletModuleLoadedCtx = null;
   }
 
   // ===== Helper conversions =====

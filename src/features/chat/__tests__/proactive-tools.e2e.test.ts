@@ -14,7 +14,7 @@ describe('Proactive tools end-to-end via ChatToolsService (live-call path)', () 
 
   it('schedules, lists, then cancels a message with linkedEntity', async () => {
     const sched = await container.chatTools.runMany([
-      { action: 'scheduleMessage', text: 'kya progress hai?', scheduledAtISO: new Date(future).toISOString(), linkedEntity: { type: 'todo', value: 'physics' } },
+      { action: 'scheduleMessage', text: 'kya progress hai?', scheduledAtISO: new Date(future).toISOString(), linkedEntity: { type: 'todo', value: 'physics' }, confirmed: true },
     ]);
     expect(sched.ok).toBe(true);
     const schedId = sched.summary.match(/\(id ([^)]+)\)/)?.[1];
@@ -31,14 +31,14 @@ describe('Proactive tools end-to-end via ChatToolsService (live-call path)', () 
 
   it('rejects past-time scheduling', async () => {
     const past = await container.chatTools.runMany([
-      { action: 'scheduleMessage', text: 'past', scheduledAtISO: new Date(now - 1000).toISOString() },
+      { action: 'scheduleMessage', text: 'past', scheduledAtISO: new Date(now - 1000).toISOString(), confirmed: true },
     ]);
     expect(past.ok).toBe(false);
   });
 
   it('schedules+lists+cancels a call', async () => {
     const sched = await container.chatTools.runMany([
-      { action: 'scheduleCall', reason: 'revision check', scheduledAtISO: new Date(future).toISOString() },
+      { action: 'scheduleCall', reason: 'revision check', scheduledAtISO: new Date(future).toISOString(), confirmed: true },
     ]);
     expect(sched.ok).toBe(true);
     const id = sched.summary.match(/\(id ([^)]+)\)/)?.[1];
@@ -51,8 +51,30 @@ describe('Proactive tools end-to-end via ChatToolsService (live-call path)', () 
   });
 
   it('makeCall triggers an incoming call (proactive singleton reachable)', async () => {
-    const res = await container.chatTools.runMany([{ action: 'makeCall', reason: 'progress talk' }]);
+    const res = await container.chatTools.runMany([{ action: 'makeCall', reason: 'progress talk', confirmed: true }]);
     expect(res.ok).toBe(true);
     expect(res.summary).toContain('IncomingCall');
+  });
+
+  it('scheduleMessage/makeCall/scheduleCall need explicit confirmation first (AUDIT FIX round 2)', async () => {
+    const sched = await container.chatTools.runMany([
+      { action: 'scheduleMessage', text: 'confirm me', scheduledAtISO: new Date(future).toISOString() },
+    ]);
+    expect(sched.ok).toBe(false);
+    expect(sched.requiresConfirmation).toBe(true);
+
+    const call = await container.chatTools.runMany([{ action: 'makeCall', reason: 'confirm me' }]);
+    expect(call.ok).toBe(false);
+    expect(call.requiresConfirmation).toBe(true);
+
+    const schedCall = await container.chatTools.runMany([
+      { action: 'scheduleCall', reason: 'confirm me', scheduledAtISO: new Date(future).toISOString() },
+    ]);
+    expect(schedCall.ok).toBe(false);
+    expect(schedCall.requiresConfirmation).toBe(true);
+
+    // listScheduled / cancelScheduled are read/cleanup — still fire without confirm.
+    const list = await container.chatTools.runMany([{ action: 'listScheduled' }]);
+    expect(list.requiresConfirmation).not.toBe(true);
   });
 });

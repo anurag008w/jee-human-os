@@ -178,6 +178,13 @@ export interface LiveSettingsConfig {
   temperature?: number;
   maxOutputTokens?: number;
   thinkingBudget?: number;
+  /**
+   * Ordered auto-fallback models used when the selected `model` becomes
+   * unavailable at connect time. User-changeable (Live Settings → Advanced);
+   * defaults to the known-good Gemini Live models. When empty/omitted, the
+   * client falls back to the built-in default chain.
+   */
+  fallbackModels?: string[];
 }
 
 export const DEFAULT_LIVE_SETTINGS: LiveSettingsConfig = {
@@ -191,7 +198,23 @@ export const DEFAULT_LIVE_SETTINGS: LiveSettingsConfig = {
   temperature: 0.7,
   maxOutputTokens: 2048,
   thinkingBudget: 0,
+  fallbackModels: [
+    'gemini-2.5-flash-native-audio-latest',
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+  ],
 };
+
+/**
+ * The last-resort default fallback chain, used only when a config provides no
+ * `fallbackModels`. Kept separate from DEFAULT_LIVE_SETTINGS so stored configs
+ * that predate the field still resolve to a sane chain without mutating state.
+ */
+export const DEFAULT_LIVE_FALLBACK_MODELS: string[] = [
+  'gemini-3.1-flash-live-preview',
+  'gemini-2.5-flash-native-audio-latest',
+  'gemini-2.5-flash',
+];
 
 /**
  * Settings that are baked into the Gemini Live SESSION at connect() time and

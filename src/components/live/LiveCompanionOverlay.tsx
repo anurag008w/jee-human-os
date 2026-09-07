@@ -24,7 +24,9 @@ import {
   Wrench,
 } from 'lucide-react';
 import type { ChatMessage, ChatToolCallRecord } from '../../core/domain/chat';
+import { isPureSilenceToken } from '../../core/domain/chat';
 import { TOOL_LABELS, type ChatToolMeta } from '../../core/domain/chat-tools';
+import { sanitizeControlTokens } from '../../features/chat/leak-sanitizer';
 import type {
   LiveAudioRoute,
   LiveCameraLens,
@@ -37,6 +39,7 @@ import type {
 import { requiresLiveReconnect } from '../../core/domain/live-types';
 import { GeminiLiveClient, type LiveClientCallbacks } from '../../core/domain/live-client';
 import { proactiveAgentService } from '../../features/ai/proactive-agent.service';
+import { setLiveCallActive } from '../../features/ai/live-call-state';
 import { haptic, hapticError } from '../../lib/haptics';
 import ChatMarkdown from '../ChatMarkdown';
 import StreamingText from '../StreamingText';
@@ -65,6 +68,33 @@ let activeLiveClient: GeminiLiveClient | null = null;
 // `myEpoch === overlayEpoch` makes the global FGS/lifecycle ownership
 // generation-scoped: only the newest overlay may touch the shared service.
 let overlayEpoch = 0;
+
+/**
+ * AUDIT FIX (round 3, SEVERE): scrub secrets + raw SDK internals out of a live
+ * error message before it is rendered in the student-facing banner. Without
+ * this, a gateway/provider error string could surface the configured baseUrl
+ * (e.g. `wss://my-gateway.box/ws/...BidiGenerateContent`) or a pasted API key
+ * verbatim. Chat messages are already leak-sanitized; live errors were the gap.
+ */
+function scrubLiveErrorMessage(message: string, secrets: { baseUrl?: string; apiKey?: string }): string {
+  let out = message;
+  const base = secrets.baseUrl?.trim();
+  const key = secrets.apiKey?.trim();
+  if (base) {
+    try {
+      const u = new URL(base);
+      // Replace both the full URL and its bare host so partial echoes are caught.
+      out = out.split(base.replace(/\/+$/, '')).join('[your-gateway]');
+      out = out.split(u.host).join('[your-gateway-host]');
+    } catch {
+      out = out.split(base).join('[your-gateway]');
+    }
+  }
+  if (key && key.length >= 4) out = out.split(key).join('***');
+  // Mask any `key=...` query param that may appear in a echoed SDK URL.
+  out = out.replace(/([?&]key=)[^&\s"'<>]+/gi, '$1***');
+  return sanitizeControlTokens(out).trim();
+}
 
 function ThinkingBlock({ text, streaming = false }: { text: string; streaming?: boolean }) {
   const [open, setOpen] = useState(false);
@@ -241,7 +271,17 @@ export default function LiveCompanionOverlay({
   };
 
   const clientRef = useRef<GeminiLiveClient | null>(null);
-  const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
+  /** AUDIT FIX (round 1, MEDIUM): while a settings-change reconnect tears the
+   *  session down (reconnectWithNewConfig → disconnect(true) → status
+   *  'disconnected'), the status mapper must NOT flash the red
+   *  "Call disconnected unexpectedly." banner — this teardown is expected and
+   *  user-initiated, not a failure. Cleared when the replacement connects. */
+  const suppressingDisconnectErrorRef = useRef(false);
+  // AUDIT FIX (round 2): generation token so a STALE settings-reconnect promise
+  // can never stamp error/suppressing state over a newer reconnect attempt.
+  const settingsReconnectGenRef = useRef(0);
+  // AUDIT FIX (round 2): tool-reveal clear timer, cancelled on teardown.
+  const activeToolTimerRef = useRef<number | null>(null);  const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
   // Debounce handle for the live-call reply notification: coalesces the many
   // per-audio-chunk transcript updates into a clean same-id refresh (so the
   // drawer notification grows with the full long reply instead of being
@@ -268,6 +308,12 @@ export default function LiveCompanionOverlay({
   useEffect(() => {
     if (!isOpen) return;
 
+    // P5 (hang-fix): while the live call overlay is open, the proactive agent
+    // must not dispatch scheduled/inactivity incoming calls or nudges — a
+    // second call modal on top of a running call is jarring. Cleared in the
+    // cleanup below only when no other overlay owns the call anymore.
+    setLiveCallActive(true);
+
     // Expose the hang-up routine to ChatScreen so the `endLiveCall` live tool
     // can end the call programmatically. Cleared in the cleanup below.
     // P10 drain-aware: the TOOL path first lets Misa's goodbye audio finish
@@ -287,6 +333,12 @@ export default function LiveCompanionOverlay({
     const callbacks: LiveClientCallbacks = {
       onStatusChange: (newStatus) => {
         if (newStatus === 'idle' || newStatus === 'disconnected') {
+          // AUDIT FIX: an expected teardown during a settings-change reconnect
+          // is NOT an error — keep the UI in a neutral reconnecting state.
+          if (suppressingDisconnectErrorRef.current) {
+            setStatus('reconnecting');
+            return;
+          }
           if (!cancelled) {
             setStatus('error');
             setErrorMessage((prev) => prev || 'Call disconnected unexpectedly.');
@@ -294,7 +346,10 @@ export default function LiveCompanionOverlay({
           return;
         }
         setStatus(newStatus);
-        if (newStatus === 'connected') setErrorMessage(null);
+        if (newStatus === 'connected') {
+          setErrorMessage(null);
+          suppressingDisconnectErrorRef.current = false;
+        }
       },
       onTranscriptUpdate: (newTranscripts) => {
         // Parent (chat history sink) + notification debounce get every update
@@ -361,12 +416,18 @@ export default function LiveCompanionOverlay({
       },
       onToolResult: (name) => {
         setActiveTool({ name, args: {}, status: 'done' });
-        window.setTimeout(() => setActiveTool(null), 3500);
+        // AUDIT FIX (round 2, LOW): track the reveal timer so teardown can
+        // cancel it — previously it fired untracked after unmount.
+        if (activeToolTimerRef.current !== null) window.clearTimeout(activeToolTimerRef.current);
+        activeToolTimerRef.current = window.setTimeout(() => {
+          activeToolTimerRef.current = null;
+          setActiveTool(null);
+        }, 3500);
       },
       onError: (err) => {
         hapticError();
         setStatus('error');
-        setErrorMessage(err);
+        setErrorMessage(scrubLiveErrorMessage(String(err || ''), { baseUrl: config.baseUrl, apiKey }));
       },
     };
     const existingClient = activeLiveClient;
@@ -400,9 +461,9 @@ export default function LiveCompanionOverlay({
     // streams, or the user's live audio dies mid-call while the call keeps
     // running. Stopping tracks + disconnect + FGS release ALL belong to THIS
     // mount's startup only.
-    function rollbackStartup(c: typeof liveClient, existing: typeof existingClient, mic: MediaStream, cam?: MediaStream) {
+    function rollbackStartup(c: typeof liveClient, existing: typeof existingClient, mic: MediaStream, cam?: MediaStream, keepMic = false) {
       if (existing) return; // this mount doesn't own the streams/session — never touch them
-      mic.getTracks().forEach((t) => t.stop());
+      if (!keepMic) mic.getTracks().forEach((t) => t.stop());
       cam?.getTracks().forEach((t) => t.stop());
       c.disconnect();
       if (activeLiveClient === c) activeLiveClient = null;
@@ -534,11 +595,32 @@ export default function LiveCompanionOverlay({
         // Only roll back when THIS mount started the call. Re-attaching to an
         // established singleton call (existingClient) must never kill it just
         // because the idempotent arm() hiccuped.
-        rollbackStartup(liveClient, existingClient, initialMicStream, initialCameraStream);
-        if (!cancelled && !existingClient) {
+        // AUTO-RETRY (production hardening): when the Gemini handshake itself
+        // failed (session never established), DO NOT stop the mic — hand it to
+        // the client so the user's next text/speech retries the SAME selected
+        // model automatically instead of forcing a manual re-tap of Live Call.
+        const sessionEstablished =
+          liveClient.getStatus() === 'connected' ||
+          liveClient.getStatus() === 'listening' ||
+          liveClient.getStatus() === 'speaking' ||
+          liveClient.getStatus() === 'thinking' ||
+          liveClient.getStatus() === 'background-active' ||
+          liveClient.getStatus() === 'background-pip-active';
+        const keepMicForRetry = !existingClient && !cancelled && !sessionEstablished;
+        if (keepMicForRetry) {
+          liveClient.stashRetryMicStream(initialMicStream);
+        }
+        rollbackStartup(liveClient, existingClient, initialMicStream, initialCameraStream, keepMicForRetry);
+        // AUDIT FIX (round 1, MEDIUM): surface the error on the re-attach path
+        // too (existingClient). Before, any throw while re-attaching to an
+        // established call left the overlay silently stuck on a stale status
+        // with no message and no retry affordance. Rollback stays gated on
+        // !existingClient (never kill a healthy call); the ERROR TEXT is shown
+        // whenever the user is still here.
+        if (!cancelled) {
           hapticError();
           setStatus('error');
-          setErrorMessage(err?.message || 'Connection to Gemini Live failed');
+          setErrorMessage(scrubLiveErrorMessage(err?.message || 'Connection to Gemini Live failed', { baseUrl: config.baseUrl, apiKey }));
         }
       }
     })();
@@ -611,6 +693,10 @@ export default function LiveCompanionOverlay({
         window.clearTimeout(transcriptsTimerRef.current);
         transcriptsTimerRef.current = null;
       }
+      if (activeToolTimerRef.current !== null) {
+        window.clearTimeout(activeToolTimerRef.current);
+        activeToolTimerRef.current = null;
+      }
       transcriptsPendingRef.current = null;
       if (appStateListener) void appStateListener.remove();
       if (pipListener) pipListener();
@@ -619,6 +705,10 @@ export default function LiveCompanionOverlay({
       if (clientRef.current === liveClient) {
         clientRef.current = null;
       }
+      // P5 (hang-fix): release the live-call-active flag for the proactive
+      // agent — but only when NO overlay still owns a live call (a reattach
+      // remount must not clear it mid-call).
+      if (!activeLiveClient) setLiveCallActive(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, apiKey]);
@@ -855,6 +945,17 @@ export default function LiveCompanionOverlay({
     void resetNativeAudioRoute().catch(() => undefined);
     onClose(currentTranscripts);
   }
+
+  // Typing in the live composer = real activity: restart the silence timeline
+  // (no "arey suno" mid-composition) WITHOUT stopping her current speech.
+  // Throttled so a keystroke storm doesn't spam the client.
+  const composerTypingAtRef = useRef(0);
+  const handleComposerTyping = useCallback(() => {
+    const now = Date.now();
+    if (now - composerTypingAtRef.current < 1500) return;
+    composerTypingAtRef.current = now;
+    clientRef.current?.reportUserTyping();
+  }, []);
 
   // Quick-reply from the live-call notification: type in the shade, and the
   // message lands straight in the Gemini Live session (and shows in the in-app
@@ -1162,6 +1263,7 @@ export default function LiveCompanionOverlay({
             <div className="text-center space-y-1">
               <div className="flex items-center justify-center gap-2">
                 <h2 className="text-lg font-bold text-text">{isProactiveEnabled ? 'Misa' : 'Misa AI'}</h2>
+                <Sparkles size={13} className="text-peak" aria-label="Live feature in development" />
                 {isProactiveEnabled && (
                   <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-semibold text-emerald-400 border border-emerald-500/30">
                     <PhoneCall size={10} /> Live Call
@@ -1297,8 +1399,9 @@ export default function LiveCompanionOverlay({
                   </div>
                 )}
 
-                {/* Live Transcripts */}
-                {transcripts.map((t) => (
+                {/* Live Transcripts — "[silence]" turns never render (safe net,
+                    upstream updateTranscript already drops them). */}
+                {transcripts.filter((t) => !isPureSilenceToken(t.text)).map((t) => (
                   <div
                     key={t.id}
                     className={`flex flex-col ${t.role === 'assistant' ? 'items-start' : 'items-end'}`}
@@ -1331,6 +1434,7 @@ export default function LiveCompanionOverlay({
                   toolCatalog={toolCatalog}
                   isExecutingTool={isExecutingTool}
                   onSend={handleSendChatMessage}
+                  onTyping={handleComposerTyping}
                 />
               </div>
             </motion.div>
@@ -1425,15 +1529,46 @@ export default function LiveCompanionOverlay({
             // "live settings not linked to the live session" bug: the client
             // held its mount-time config, so even a reconnect used stale values).
             client.updateConfig(newConfig);
+            // AUDIT FIX (round 1, MEDIUM): the typed API key lives in
+            // newConfig.apiKey — using the stale render `apiKey` prop here meant
+            // a user fixing a bad key from Live Settings never actually applied
+            // it (the reconnect dialed with the OLD key and failed forever).
+            const reconnectApiKey = newConfig.apiKey?.trim() || apiKey;
             // Reconnect ONLY when a session-baked setting (model/voice/VAD/FPS/
             // tokens/API-key) changed. Saving unrelated settings must NOT tear
             // down a healthy call — that unconditional reconnect was the real
             // "changing settings disconnects the call" bug.
             if (requiresLiveReconnect(prev, newConfig)) {
-              client.reconnectWithNewConfig(apiKey, initialMicStream).catch(console.warn);
+              // Suppress the transient red error banner during the expected
+              // teardown/reconnect (see onStatusChange mapper).
+              suppressingDisconnectErrorRef.current = true;
+              setStatus('reconnecting');
+              setErrorMessage(null);
+              // AUDIT FIX (round 2, MEDIUM): rapid consecutive settings saves
+              // race — reconnect #2's internal disconnect() aborts reconnect #1,
+              // whose stale .catch then stamped 'error' over the healthy #2
+              // attempt. A generation token makes only the NEWEST reconnect
+              // allowed to touch error/suppressing state.
+              const reconnectGen = (settingsReconnectGenRef.current += 1);
+              client
+                .reconnectWithNewConfig(reconnectApiKey, initialMicStream)
+                .then(() => {
+                  if (reconnectGen !== settingsReconnectGenRef.current) return;
+                  suppressingDisconnectErrorRef.current = false;
+                })
+                .catch((e: any) => {
+                  console.warn('[LiveCompanion] Settings reconnect failed:', e);
+                  if (reconnectGen !== settingsReconnectGenRef.current) return;
+                  suppressingDisconnectErrorRef.current = false;
+                  setStatus('error');
+                  setErrorMessage(e?.message || 'Reconnect after settings change failed.');
+                });
             } else if (prev.defaultAudioRoute !== newConfig.defaultAudioRoute) {
-              // Route changed but the session didn't — just re-route the audio.
+              // Route changed but the session didn't — just re-route the audio
+              // AND keep the overlay's route chip in sync (audit fix: it used
+              // to stay on the old route until a full remount).
               void client.setAudioRoute(newConfig.defaultAudioRoute);
+              setAudioRoute(newConfig.defaultAudioRoute);
             }
           }}
           defaultApiKey={apiKey}
@@ -1447,10 +1582,12 @@ const LiveChatComposer = memo(function LiveChatComposer({
   toolCatalog,
   isExecutingTool,
   onSend,
+  onTyping,
 }: {
   toolCatalog: ChatToolMeta[];
   isExecutingTool: boolean;
   onSend: (text: string, toolMentions: string[]) => void;
+  onTyping?: () => void;
 }) {
   const [text, setText] = useState('');
   const [toolMentions, setToolMentions] = useState<string[]>([]);
@@ -1556,6 +1693,8 @@ const LiveChatComposer = memo(function LiveChatComposer({
             onChange={(e) => {
               const val = e.target.value;
               setText(val);
+              // P2: typing resets the live silence timeline (throttled upstream).
+              onTyping?.();
               const match = /(^|\s)@([a-zA-Z0-9_-]*)$/.exec(val);
               if (match) {
                 setToolQuery(match[2] ?? '');

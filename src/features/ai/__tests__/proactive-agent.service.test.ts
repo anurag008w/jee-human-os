@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { proactiveAgentService } from '../proactive-agent.service';
 import { relationshipManager } from '../relationship-state';
+import { setLiveCallActive } from '../live-call-state';
 
 const mockStorage: Record<string, string> = {};
 global.localStorage = {
@@ -150,5 +151,36 @@ describe('ProactiveAgentService Production Hardening', () => {
     proactiveAgentService.triggerIncomingCall('Study check-in');
     expect(callTriggered).toBe(false);
     unsub();
+  });
+
+  it('10. injectMessageIntoChat is blocked while a live call is active (P5 choke-point)', () => {
+    const injected: any[] = [];
+    const unsub = proactiveAgentService.onMessageInjection((msg) => {
+      injected.push(msg);
+    });
+    // Use the real module singleton flag — the service reads it on dispatch.
+    setLiveCallActive(true);
+    proactiveAgentService.injectMessageIntoChat('Hii, kya chal raha hai?');
+    expect(injected.length).toBe(0);
+    setLiveCallActive(false);
+    proactiveAgentService.injectMessageIntoChat('Hii, live call khatam — ab allowed!');
+    expect(injected.length).toBe(1);
+    unsub();
+  });
+
+  it('11. permanently-blocked scheduled message is dropped after retry cap, not lost silently or retried forever', () => {
+    const now = Date.now();
+    // First attempt blocked → retry scheduled (cap 3 total tries).
+    proactiveAgentService.scheduleMessage('Optics wala reminder', now - 5000, 'optics');
+    for (let i = 0; i < 5; i += 1) {
+      // checkScheduledMessages is private — cast to drive the retry loop, same
+      // as the other private-access casts in this suite.
+      (proactiveAgentService as any).checkScheduledMessages();
+      // Simulate the 5-min retry becoming due again.
+      const items = (proactiveAgentService as any).scheduledMessages as Array<{ scheduledTime: number }>;
+      for (const s of items) s.scheduledTime = Date.now() - 1000;
+    }
+    const remaining = (proactiveAgentService as any).scheduledMessages as any[];
+    expect(remaining.length).toBe(0);
   });
 });

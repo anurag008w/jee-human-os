@@ -598,13 +598,13 @@ export default function AISettingsScreen({
       )}
 
 
-      {/* Misa Proactive & Incoming Calls */}
+      {/* Misa Proactive & Incoming Calls — dev features (in development) */}
       <div className="mb-2.5">
         <SectionHeader
           icon={<PhoneIncoming size={14} color="var(--color-l)" />}
           accent="var(--color-l)"
           title="Misa Autonomous Calls & Proactivity"
-          meta={proactivePrefs.enabled ? 'active' : 'off'}
+          meta={proactivePrefs.enabled ? 'active ✨' : 'off ✨'}
         />
       </div>
 
@@ -616,7 +616,10 @@ export default function AISettingsScreen({
               <Sparkles size={19} />
             </span>
             <div className="min-w-0">
-              <p className="font-display text-[15px] font-bold">Proactive study nudges</p>
+              <div className="flex items-center gap-1.5">
+                <p className="font-display text-[15px] font-bold">Proactive study nudges</p>
+                <Sparkles size={14} className="text-peak" aria-label="In development" />
+              </div>
               <p className="text-xs leading-snug text-muted">
                 Misa spontaneously checks in, follows up on your study struggles, and keeps momentum going (100% Offline & Online).
               </p>
@@ -642,7 +645,10 @@ export default function AISettingsScreen({
               <PhoneCall size={19} />
             </span>
             <div className="min-w-0">
-              <p className="font-display text-[15px] font-bold">WhatsApp-style incoming live calls</p>
+              <div className="flex items-center gap-1.5">
+                <p className="font-display text-[15px] font-bold">WhatsApp-style incoming live calls</p>
+                <Sparkles size={14} className="text-peak" aria-label="In development" />
+              </div>
               <p className="text-xs leading-snug text-muted">
                 Misa can call you live for scheduled study checks or quick verbal problem-solving (rare & spam-free).
               </p>

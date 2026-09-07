@@ -252,10 +252,21 @@ describe('full app data backup (production-grade)', () => {
     const payload = parseBackup(serializeBackup(buildBackupPayload(source, chatStore)));
     applyBackup(payload, { store, chat: { replaceStore: (sessions) => (replaced = sessions) } });
 
-    // The restored state must be byte-identical to what the normalizer produces,
-    // with the regenerable model catalog stripped (API cache, not user data).
+    // The restored state must match what the normalizer produces, with the
+    // regenerable model catalog stripped (API cache, not user data) AND the
+    // provider/websearch secrets redacted (AUDIT FIX round 2). Import into a
+    // fresh store can't resurrect keys the backup no longer carries.
     const expected = normalizeState(source);
-    expected.aiSettings = { ...expected.aiSettings, modelCache: {} };
+    expected.aiSettings = {
+      ...expected.aiSettings,
+      modelCache: {},
+      providers: {
+        ...expected.aiSettings.providers,
+        openrouter: { ...expected.aiSettings.providers.openrouter, apiKey: undefined, customHeaders: undefined },
+        gemini: { ...expected.aiSettings.providers.gemini, apiKey: undefined, customHeaders: undefined },
+      },
+      websearch: { ...expected.aiSettings.websearch, apiKey: '' },
+    };
     expect(store.saved).toHaveLength(1);
     expect(store.saved[0]).toEqual(expected);
     // Chat history restored in order.
@@ -328,7 +339,11 @@ describe('full app data backup (production-grade)', () => {
 
     expect(restored.postJourney).toEqual(source.postJourney);
     expect(restored.userProfile).toEqual(source.userProfile);
-    expect(restored.aiSettings.providers.openrouter.apiKey).toBe('sk-test-key');
+    // AUDIT FIX (round 2): backups no longer ship API keys — they are redacted.
+    // On import into an EMPTY store there's no current device key to preserve,
+    // so the provider config survives (label/model/enabled) but the secret is gone.
+    expect(restored.aiSettings.providers.openrouter?.apiKey).toBeUndefined();
+    expect(restored.aiSettings.providers.openrouter?.label).toBe('OpenRouter');
     // Model catalog is regenerable → excluded from the backup entirely.
     expect(restored.aiSettings.modelCache).toEqual({});
     expect(restored.aiSettings.chat.systemPrompt).toBe('custom Misa coach prompt');
@@ -366,12 +381,22 @@ describe('full app data + schema hygiene', () => {
     expect(payload.scope).toBe('full');
   });
 
-  it('exported state JSON is parseable and round-trips through normalizeState unchanged', () => {
+  it('exported state JSON is parseable and round-trips through normalizeState — secrets redacted', () => {
     const source = buildFullState();
     const json = serializeBackup(buildBackupPayload(source, null));
     const parsed = JSON.parse(json) as { data: { state: unknown } };
     const expected = normalizeState(source);
-    expected.aiSettings = { ...expected.aiSettings, modelCache: {} };
+    // AUDIT FIX (round 2): backups no longer carry provider/websearch secrets.
+    expected.aiSettings = {
+      ...expected.aiSettings,
+      modelCache: {},
+      providers: {
+        ...expected.aiSettings.providers,
+        openrouter: { ...expected.aiSettings.providers.openrouter, apiKey: undefined, customHeaders: undefined },
+        gemini: { ...expected.aiSettings.providers.gemini, apiKey: undefined, customHeaders: undefined },
+      },
+      websearch: { ...expected.aiSettings.websearch, apiKey: '' },
+    };
     expect(normalizeState(parsed.data.state)).toEqual(expected);
   });
 

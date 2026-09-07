@@ -25,7 +25,23 @@ export class CapacitorHttpClient implements HttpClient {
     let lastError: unknown;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        const res = await CapacitorHttp.request(this.toOptions(init));
+        if (init.signal?.aborted) {
+          throw new HttpError('Request aborted', 0, 'aborted', null);
+        }
+        // AUDIT FIX (round 3, MEDIUM): CapacitorHttp can't abort an in-flight
+        // request via a signal, so we honor the external abort by:
+        //  1. pre-flight check above, and
+        //  2. racing the response against the abort event right after it lands,
+        //     so a user "stop" during a long request still surfaces as 'aborted'
+        //     instead of completing the (now-wasted) call. Same contract as the
+        //     web FetchHttpClient, which the rest of the app relies on.
+        const aborted = new Promise<never>((_, reject) => {
+          if (init.signal) {
+            if (init.signal.aborted) reject(new HttpError('Request aborted', 0, 'aborted', null));
+            else init.signal.addEventListener('abort', () => reject(new HttpError('Request aborted', 0, 'aborted', null)), { once: true });
+          }
+        });
+        const res = await Promise.race([CapacitorHttp.request(this.toOptions(init)), aborted]);
         const status = res.status ?? 0;
         if (status < 200 || status >= 300) {
           const message = extractErrorMessage(res.data) ?? `HTTP ${status}`;

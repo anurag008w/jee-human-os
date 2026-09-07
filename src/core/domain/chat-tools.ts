@@ -173,15 +173,18 @@ export const chatToolActionSchema = z.discriminatedUnion('action', [
       type: z.enum(['todo', 'task', 'memory', 'keyword']),
       value: z.string().min(1).max(200).describe('Entity ka naam/id — jab ye complete ho toh scheduled auto-cancel'),
     }).optional(),
+    confirmed: z.boolean().optional(),
   }),
   z.object({
     action: z.literal('makeCall'),
     reason: z.string().min(1).max(300).describe('Call ka reason — user ko dikhega'),
+    confirmed: z.boolean().optional(),
   }),
   z.object({
     action: z.literal('scheduleCall'),
     reason: z.string().min(1).max(300).describe('Call ka reason'),
     scheduledAtISO: z.string().min(1).max(40).describe('ISO-8601 timestamp — kab call karna hai (future)'),
+    confirmed: z.boolean().optional(),
   }),
   z.object({
     action: z.literal('listScheduled'),

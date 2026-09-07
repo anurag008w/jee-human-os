@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
   Archive,
@@ -44,7 +44,7 @@ import { TOOL_LABELS, type ChatToolMeta } from '../core/domain/chat-tools';
 import type { ArchivedConversation } from '../core/domain/chat-transcript';
 import { liveStreamingTailId } from '../core/domain/chat-transcript';
 import { isAbortError, type ModelInfo } from '../core/domain/llm';
-import { defaultChatPrefs, globalChatPrefsFromSettings } from '../core/domain/chat';
+import { defaultChatPrefs, globalChatPrefsFromSettings, isPureSilenceToken } from '../core/domain/chat';
 import { deviceTimeZone } from '../core/ports/clock';
 import { container } from '../di/container';
 import { redoLastAiAction, undoLastAiAction } from '../core/domain/ai-actions';
@@ -127,6 +127,30 @@ const ATTACH_TOOLS: { id: string; label: string; hint: string; icon: React.React
   { id: 'notes', label: 'Notes', hint: 'Text files', icon: <StickyNote size={20} /> },
 ];
 
+// ── Windowed chat rendering (hang-fix P1) ─────────────────────────────────
+// Renders only the message TAIL instead of the whole history, so a long
+// conversation never re-renders its entire DOM on every streamed chunk. Older
+// messages load in batches when the user scrolls up (infinite-scroll style).
+export const CHAT_WINDOW_SIZE = 120;
+export const CHAT_WINDOW_STEP = 120;
+
+/** Oldest rendered index so the newest `windowSize` messages are visible. */
+export function chatTailStart(total: number, windowSize = CHAT_WINDOW_SIZE): number {
+  if (total <= 0) return 0;
+  return Math.max(0, total - windowSize);
+}
+
+/** Next window start when the user scrolls up to load older messages. */
+export function chatLoadOlderStart(current: number, step = CHAT_WINDOW_STEP): number {
+  return Math.max(0, current - step);
+}
+
+/** The bounded slice rendered by the chat thread. */
+export function chatVisibleMessages<T>(messages: T[], windowStart: number): T[] {
+  if (windowStart <= 0) return messages;
+  return messages.slice(windowStart);
+}
+
 export default function ChatScreen({
   targetSessionId,
   onTargetConsumed,
@@ -146,6 +170,13 @@ export default function ChatScreen({
   const actionsRef = useRef<MessageActions>(null!);
   const [draft, setDraft] = useState('');
   const [streaming, setStreaming] = useState(false);
+  // ── Windowed rendering (hang-fix P1) ────────────────────────────────────
+  // `windowStart` = oldest rendered message index. `stuckToBottom` = the user
+  // is reading the latest messages (auto-scroll + window re-base allowed).
+  const [windowStart, setWindowStart] = useState<number>(0);
+  const [stuckToBottom, setStuckToBottom] = useState(true);
+  const loadingOlderRef = useRef(false);
+  const prevScrollHeightRef = useRef<number | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   /** Id of the freshly generated assistant message that should reveal bubble-by-bubble. */
@@ -202,6 +233,12 @@ export default function ChatScreen({
     [providerSig],
   );
   const messages = active?.messages ?? [];
+  // Bounded slice rendered by the thread — the full history stays in memory,
+  // only the DOM is windowed (hang-fix P1).
+  const visibleMessages = chatVisibleMessages(messages, windowStart).filter(
+    // "[silence]" is a no-op token: never render (old persisted turns included).
+    (m) => !isPureSilenceToken(m.content),
+  );
   const hasMessages = active !== null && messages.length > 0;
   // Screen-reader live region: announce when a freshly generated AI reply is
   // revealed (old chats and session switches never replay their history).
@@ -243,25 +280,19 @@ export default function ChatScreen({
 
   // Link the Live settings so a change made in the AI Settings screen (which
   // writes aiSettings.live to the SAME store) is reflected here — otherwise the
-  // live overlay opens a call with a stale, mount-time config. Poll the store
-  // (same pattern as the provider list above) and only commit when it changed,
-  // so an untouched config never triggers a re-render. Both the call overlay
-  // (LiveSettingsModal → onUpdateConfig) and AISettingsScreen write to this
-  // single store, so polling keeps every surface in sync.
+  // live overlay opens a call with a stale, mount-time config. Hang-fix P3:
+  // event-driven via the store subscription (same 300ms poll is gone) — only
+  // commit when it actually changed, so an untouched config never re-renders.
   useEffect(() => {
-    let disposed = false;
-    const id = setInterval(() => {
-      if (disposed) return;
+    const syncLiveConfig = () => {
       const fromStore = container.store.get()?.aiSettings?.live;
       if (!fromStore) return;
       setLiveConfig((prev) =>
         JSON.stringify(prev) === JSON.stringify(fromStore) ? prev : fromStore,
       );
-    }, 300);
-    return () => {
-      disposed = true;
-      clearInterval(id);
     };
+    syncLiveConfig();
+    return container.store.subscribe(syncLiveConfig);
   }, []);
 
   // "@" tool picker: close when the user interacts OUTSIDE the picker + input
@@ -361,8 +392,64 @@ export default function ChatScreen({
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [active?.messages.length, streaming]);
+    if (el && stuckToBottom) el.scrollTop = el.scrollHeight;
+  }, [active?.messages.length, streaming, stuckToBottom]);
+
+  // ── Windowed rendering (hang-fix P1) ─────────────────────────────────────
+  // Scroll handler: user near the top → load older window; user away from the
+  // bottom → release auto-scroll so reading history isn't yanked back.
+  const handleThreadScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    setStuckToBottom(nearBottom);
+    if (el.scrollTop < 120 && windowStart > 0) {
+      if (!loadingOlderRef.current) {
+        loadingOlderRef.current = true;
+        prevScrollHeightRef.current = el.scrollHeight;
+        requestAnimationFrame(() => {
+          loadingOlderRef.current = false;
+          setWindowStart((prev) => chatLoadOlderStart(prev));
+        });
+      }
+    }
+  }, [windowStart]);
+
+  // Restore the scroll anchor after older messages are prepended, so the
+  // viewport doesn't jump when the window grows.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el || prevScrollHeightRef.current === null) return;
+    el.scrollTop = el.scrollHeight - prevScrollHeightRef.current;
+    prevScrollHeightRef.current = null;
+  }, [windowStart, visibleMessages.length]);
+
+  // Hang-fix P2: page hide = debounced chat writes must land on disk now
+  // (user closed the tab / app is being backgrounded / process may die).
+  useEffect(() => {
+    const flushChat = () => container.chat.flush();
+    window.addEventListener('pagehide', flushChat);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushChat();
+    });
+    return () => {
+      window.removeEventListener('pagehide', flushChat);
+      document.removeEventListener('visibilitychange', flushChat);
+    };
+  }, []);
+
+  // While stuck at the bottom, keep the newest messages visible as the
+  // conversation grows (streamed chunks, proactive injections).
+  useEffect(() => {
+    if (!stuckToBottom) return;
+    setWindowStart(() => chatTailStart(messages.length));
+  }, [messages.length, stuckToBottom]);
+
+  // Session switch: reset the window to the tail and re-stick to the bottom.
+  useEffect(() => {
+    setWindowStart(() => chatTailStart(messages.length));
+    setStuckToBottom(true);
+  }, [activeId]);
 
   // If the screen unmounts mid-stream, the in-flight AbortController is
   // cancelled by stop(); nothing paced is left behind.
@@ -457,7 +544,15 @@ export default function ChatScreen({
    * hang-up path (handleLiveOverlayClose) re-applies the final transcript.
    */
   const liveTranscriptTimerRef = useRef<number | null>(null);
-  const liveTranscriptSnapshotRef = useRef<LiveTranscriptItem[] | null>(null);
+  /** Latest live transcript + the chat session it BELONGS to, captured at store
+   *  time. Capturing the sid here (not re-reading it at flush time) closes a
+   *  race: a post-disconnect `onTranscriptUpdate` that arrives AFTER
+   *  `liveCallSessionIdRef` is cleared can no longer mis-target a different
+   *  active chat session. */
+  const liveTranscriptSnapshotRef = useRef<{ transcripts: LiveTranscriptItem[]; sid: string } | null>(null);
+  /** Set when the call overlay is closed/hung up; any late transcript emitted
+   *  by the client afterward is ignored instead of re-arming a new flush. */
+  const liveCallSessionClosedRef = useRef(false);
   const [liveIncomingMeta, setLiveIncomingMeta] = useState<{ isIncomingCall: boolean; reason?: string; origin?: LiveCallOrigin } | undefined>(undefined);
   const [liveConfig, setLiveConfig] = useState<LiveSettingsConfig>(() => {
     const liveFromStore = container.store.get()?.aiSettings?.live;
@@ -469,6 +564,13 @@ export default function ChatScreen({
       return DEFAULT_LIVE_SETTINGS;
     }
   });
+  // AUDIT FIX (round 1, LOW): live mirror ref for long-lived closures — the
+  // coalesced transcript flush timer (250ms) and the overlay-close re-apply run
+  // with the render that CREATED them; after a mid-call model change they would
+  // stamp OLD model names on the synced assistant messages. The ref always
+  // holds the LATEST config.
+  const liveConfigRef = useRef(liveConfig);
+  liveConfigRef.current = liveConfig;
 
   const handleUpdateLiveConfig = (newCfg: LiveSettingsConfig) => {
     setLiveConfig(newCfg);
@@ -617,6 +719,7 @@ export default function ChatScreen({
           setLiveAudioFocusGranted(true);
           setLiveMicStream(stream);
           liveCallSessionIdRef.current = active?.id || ensureSession().id;
+          liveCallSessionClosedRef.current = false;
           setShowLiveOverlay(true);
           return;
         } catch {
@@ -650,6 +753,7 @@ export default function ChatScreen({
     setLiveCamStream(camStream || null);
     setShowLivePermission(false);
     liveCallSessionIdRef.current = active?.id || ensureSession().id;
+    liveCallSessionClosedRef.current = false;
     setShowLiveOverlay(true);
   };
 
@@ -673,7 +777,15 @@ export default function ChatScreen({
           const s = container.syncCoordinator.getSession();
           const gateway = container.providerSettings.getHiddenDefaultFull();
           const root = s?.serverUrl ?? (gateway?.baseUrl ? gateway.baseUrl.replace(/\/+$/, '') : '');
-          const baseUrl = root ? (/\/v1$/.test(root) ? root : `${root}/v1`) : 'https://api.smartrotator.com/v1';
+          // Prefer the session/gateway root, then the user's own baseUrl override
+          // in Web Search settings, then the known-good default. The default is
+          // never a lock — the user can always override via settings.
+          const baseUrl =
+            root
+              ? (/\/v1$/.test(root) ? root : `${root}/v1`)
+              : wsSettings.baseUrl?.trim()
+                ? (/\/v1$/.test(wsSettings.baseUrl.trim()) ? wsSettings.baseUrl.trim() : `${wsSettings.baseUrl.trim()}/v1`)
+                : 'https://api.smartrotator.com/v1';
           const key = s?.apiKey || wsSettings.apiKey.trim() || gateway?.apiKey || '';
           if (key && query) {
             const searchRes = await container.websearch.search(
@@ -712,11 +824,15 @@ export default function ChatScreen({
         if (fallbackKey && query) {
           try {
             const customModel = wsSettings?.model?.trim() || 'gemini-2.5-flash';
+            // AUDIT FIX (round 2, LOW): the API key was passed in the QUERY
+            // STRING — it leaks through proxies, WebView network capture and
+            // server access logs. Send it via the x-goog-api-key header like
+            // the primary web-search path does.
             const resp = await fetch(
-              `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(customModel)}:generateContent?key=${fallbackKey}`,
+              `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(customModel)}:generateContent`,
               {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': fallbackKey },
                 body: JSON.stringify({
                   contents: [{ parts: [{ text: `Search the web and provide direct factual information with dates/sources for: ${query}` }] }],
                   tools: [{ google_search: {} }],
@@ -967,50 +1083,60 @@ export default function ChatScreen({
 
   const handleLiveTranscriptUpdate = (transcripts: LiveTranscriptItem[]) => {
     if (transcripts.length === 0) return;
+    // Once the call is closed (hang-up), a late transcript emission from the
+    // client must never re-arm a flush and mis-target another chat session.
+    if (liveCallSessionClosedRef.current) return;
     // Strictly isolate live call messages to the session where the call was initiated
     const targetSessionId = liveCallSessionIdRef.current || active?.id;
     if (!targetSessionId) return;
 
-    // Coalesce the per-chunk flush: keep the latest snapshot, but only run the
-    // expensive sync work (appendMessage→full-store persist, listSessions deep
-    // clone, setSessions) once per quiet window — never once per streamed chunk.
-    liveTranscriptSnapshotRef.current = transcripts;
+    // Coalesce the per-chunk flush: keep the latest snapshot + the session id
+    // it belongs to, but only run the expensive sync work (appendMessage→full-store
+    // persist, listSessions deep clone, setSessions) once per quiet window — never
+    // once per streamed chunk.
+    liveTranscriptSnapshotRef.current = { transcripts, sid: targetSessionId };
     if (liveTranscriptTimerRef.current !== null) return;
     liveTranscriptTimerRef.current = window.setTimeout(() => {
       liveTranscriptTimerRef.current = null;
       const latest = liveTranscriptSnapshotRef.current;
       liveTranscriptSnapshotRef.current = null;
-      if (!latest || latest.length === 0) return;
-      const sid = liveCallSessionIdRef.current || active?.id;
-      if (!sid) return;
+      if (!latest || latest.transcripts.length === 0) return;
+      // Use the sid captured when the snapshot was STORED — never re-derive
+      // from liveCallSessionIdRef (may already be nulled) or active session.
+      const sid = latest.sid;
       const msgs: ChatMessage[] = [];
-      for (const t of latest) {
+      for (const t of latest.transcripts) {
         if (!t || typeof t.text !== 'string' || !t.text.trim()) continue;
         msgs.push({
           id: t.id,
           role: t.role,
           content: t.text,
           createdAt: t.timestamp,
-          model: t.role === 'assistant' ? liveConfig.model : undefined,
+          model: t.role === 'assistant' ? liveConfigRef.current.model : undefined,
           toolCalls: t.toolCalls,
           reasoning: t.reasoning,
         });
       }
       // One persist for the whole flush instead of one JSON.stringify +
       // localStorage write per chunk (N × full-store cost mid-call).
-      container.chat.appendMessages(sid, msgs);
-      const all = container.chat.listSessions();
-      setSessions(all);
+      if (msgs.length > 0) {
+        container.chat.appendMessages(sid, msgs);
+        const all = container.chat.listSessions();
+        setSessions(all);
+      }
       // Streaming-tail tracking: only the CURRENTLY growing assistant reply stays
       // plain-text. Once a user turn lands (or the reply id is superseded), the
       // flag drops and that bubble gets its single markdown parse.
-      setLiveStreamingMsgId(liveStreamingTailId(latest));
+      setLiveStreamingMsgId(liveStreamingTailId(latest.transcripts));
     }, 250);
     // Never hijack activeId if the user navigated to another chat during the call
   };
 
   const handleLiveOverlayClose = (transcripts: LiveTranscriptItem[]) => {
     setShowLiveOverlay(false);
+    // Late transcript emissions after this point belong to a CLOSED call — they
+    // must never re-arm a coalesced flush against a different chat session.
+    liveCallSessionClosedRef.current = true;
     // Cancel any pending coalesced transcript flush — the final transcript
     // array is re-applied idempotently below, so the timer must not fire later
     // against a call that has already been torn down.
@@ -1044,7 +1170,7 @@ export default function ChatScreen({
           role: t.role,
           content: t.text,
           createdAt: t.timestamp,
-          model: t.role === 'assistant' ? liveConfig.model : undefined,
+          model: t.role === 'assistant' ? liveConfigRef.current.model : undefined,
           toolCalls: t.toolCalls,
           reasoning: t.reasoning,
         });
@@ -1140,7 +1266,7 @@ export default function ChatScreen({
   }
 
   function clearMessages() {
-    if (active && confirm('Is chat ke saare messages delete karne hain?')) {
+    if (active && confirm('Is chat ke SAARE messages permanently delete karne hain? Ye undo nahi ho sakta.')) {
       container.chat.clearSession(active.id);
       refresh();
     }
@@ -1200,6 +1326,8 @@ export default function ChatScreen({
   }
 
   async function send() {
+    // User initiated a send — snap back to the latest messages (hang-fix P1).
+    setStuckToBottom(true);
     const pendingDraft = draft;
     const pendingAttachments = attachments;
     const text = buildPromptWithAttachments(pendingDraft.trim(), pendingAttachments);
@@ -1349,7 +1477,13 @@ export default function ChatScreen({
       // an old chat must never replay it.
       if (sent && lastAssistantId) {
         setRevealId(lastAssistantId);
-        const finalAssistant = active?.messages.find((m) => m.id === lastAssistantId);
+        // AUDIT FIX (round 1, LOW): `active` here is the render-closure session
+        // captured when doSend STARTED — before the reply streamed in, so
+        // active.messages never contains the new assistant message and
+        // finalAssistant was almost always undefined (the proactive agent got an
+        // empty reply). Read the fresh session from the service instead.
+        const freshSession = container.chat.getSession(sessionId);
+        const finalAssistant = freshSession?.messages.find((m) => m.id === lastAssistantId);
         proactiveAgentService.onChatTurn(text, finalAssistant?.content || '', {
           tasksCount: container.store.get().customTodos?.length || 0,
         });
@@ -1725,6 +1859,7 @@ export default function ChatScreen({
           <span className="min-w-0">
             <span className="block truncate font-display text-[15px] font-bold leading-none">{active?.title || 'Misa'}</span>
           </span>
+          <Sparkles size={13} className="shrink-0 text-peak" aria-label="Misa features in development" />
           <ChevronDown size={13} className="shrink-0 text-muted" />
         </button>
         <button
@@ -1754,17 +1889,17 @@ export default function ChatScreen({
       </header>
 
       {/* Conversation */}
-      <main ref={scrollRef} className="chat-thread" aria-label="Messages">
+      <main ref={scrollRef} className="chat-thread" aria-label="Messages" onScroll={handleThreadScroll}>
         <div role="status" className="sr-only">{liveAnnounce}</div>
         {!hasMessages && !streaming ? (
           <EmptyChat onPick={(t) => setDraft(t)} />
         ) : (
           <div className="mx-auto max-w-[48rem] py-4">
-            {messages.map((m, i) => (
+            {visibleMessages.map((m, i) => (
               <MessageBubble
                 key={m.id}
                 message={m}
-                isLast={i === messages.length - 1}
+                isLast={i === visibleMessages.length - 1}
                 showThinking={showThinking}
                 reveal={m.id === revealId}
                 revealSchedule={m.id === revealId ? revealScheduleRef.current : undefined}

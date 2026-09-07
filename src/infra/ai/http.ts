@@ -79,6 +79,17 @@ export class FetchHttpClient implements HttpClient {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    // AUDIT FIX (round 3, MEDIUM): `timeoutMs` only guarded header arrival.
+    // A gateway that stalls mid-stream would otherwise hold this connection open
+    // forever. Arm an idle timer during the body-read loop — if NO data arrives
+    // within an idle window, abort (surfacing a timeout) and let the caller retry.
+    const idleWindowMs = init.timeoutMs ?? this.defaultTimeoutMs;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => reader.cancel().catch(() => {}), idleWindowMs);
+    };
+    armIdle();
     for (;;) {
       let value: Uint8Array | undefined;
       let done = false;
@@ -87,6 +98,7 @@ export class FetchHttpClient implements HttpClient {
         value = chunk.value;
         done = chunk.done;
       } catch (err) {
+        if (idleTimer) clearTimeout(idleTimer);
         if (isAbortError(err)) {
           const byUser = init.signal?.aborted ?? false;
           throw new HttpError(byUser ? 'Request aborted' : 'SSE stream aborted', 0, byUser ? 'aborted' : 'timeout', null);
@@ -94,6 +106,8 @@ export class FetchHttpClient implements HttpClient {
         throw err;
       }
       if (done) break;
+      // Received data → reset the idle timeout.
+      armIdle();
       // CRLF-safe: normalize \r\n to \n (some servers/gateways stream with CRLF).
       buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
       if (buffer.endsWith('\r')) buffer = buffer.slice(0, -1) + '\n';
@@ -104,6 +118,7 @@ export class FetchHttpClient implements HttpClient {
         emitDataLines(frame, onData);
       }
     }
+    if (idleTimer) clearTimeout(idleTimer);
   }
 
   private async rawFetch(init: HttpRequestInit): Promise<Response> {

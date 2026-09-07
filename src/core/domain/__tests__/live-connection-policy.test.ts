@@ -6,21 +6,23 @@ describe('live connection policy', () => {
     expect(isPermanentLiveConnectionError(new Error('401 API key invalid'))).toBe(true);
     expect(isPermanentLiveConnectionError(new Error('model not found'))).toBe(true);
   });
-  it('keeps the call alive through sustained outages (long-lived rolling retry)', () => {
+  it('keeps the call alive through sustained outages (bounded rolling retry)', () => {
     expect(isPermanentLiveConnectionError(new Error('network socket closed'))).toBe(false);
-    // Old behavior ended the call after 6 attempts / 90s — a temporary
-    // multi-minute outage now keeps retrying (caller gates on user hangup).
-    expect(canRetryLiveConnection(5)).toBe(true);
-    expect(canRetryLiveConnection(6)).toBe(true);
-    expect(canRetryLiveConnection(20)).toBe(true);
-    expect(canRetryLiveConnection(49)).toBe(true);
-    expect(canRetryLiveConnection(99)).toBe(true);
+    // 4 attempts ≈ 22s of 20s-capped backoff (0.75+1.5+3+6s) — enough for a
+    // real mid-call mobile blip. Beyond that the USER-ACTIVITY path
+    // (retryConnectIfNeeded) resets the counter, so the next message/typing/
+    // speech still recovers with a fresh 4-attempt window.
+    expect(canRetryLiveConnection(4)).toBe(false);
+    expect(canRetryLiveConnection(3)).toBe(true);
+    expect(canRetryLiveConnection(2)).toBe(true);
+    expect(canRetryLiveConnection(1)).toBe(true);
+    expect(canRetryLiveConnection(0)).toBe(true);
   });
-  it('only hits the intentional safety valve after pathological churn', () => {
-    // ~2.5–3h of continuous retry at 20s-capped backoff. Terminal only as a
-    // sanity limit, never as the normal outage policy.
+  it('trips the safety valve instead of spinning an 85s+ error storm', () => {
+    // Terminal only as a sanity limit, never as the normal outage policy —
+    // otherwise a dead link spams errors every ~0.75-20s for hours on mobile.
     expect(canRetryLiveConnection(MAX_LIVE_RECONNECT_ATTEMPTS - 1)).toBe(true);
     expect(canRetryLiveConnection(MAX_LIVE_RECONNECT_ATTEMPTS)).toBe(false);
-    expect(MAX_LIVE_RECONNECT_ATTEMPTS).toBe(500);
+    expect(MAX_LIVE_RECONNECT_ATTEMPTS).toBe(4);
   });
 });

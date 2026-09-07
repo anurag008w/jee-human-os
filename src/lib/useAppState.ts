@@ -25,22 +25,33 @@ export function useAppState() {
   const [adminDay, setAdminDayState] = useState<number | null>(null);
   /** One-time banner when storage was full and old memories got trimmed (M7). */
   const [pruneNotice, setPruneNotice] = useState<string | null>(null);
+  /** One-time banner when the last persist hit a storage WRITE failure
+   *  (quota / private-mode) — data is safe in memory but will be lost on
+   *  restart unless the user frees space (audit round 1). */
+  const [storageWriteError, setStorageWriteError] = useState<string | null>(null);
+  /** One-time banner when the CHAT blob failed to persist (quota) — chats are
+   *  safe in memory but lost on restart (audit round 2). */
+  const [chatWriteError, setChatWriteError] = useState<string | null>(null);
 
-  // Listen for external store updates (e.g., from chat tools) and sync state
+  // Listen for external store updates (e.g., from chat tools) and sync state.
+  // Hang-fix P3: event-driven — the store emits on every save, so we never
+  // poll, and the UI reflects a mutation immediately instead of within 100ms.
   useEffect(() => {
-    let lastState = container.store.get();
-    const checkInterval = setInterval(() => {
-      const currentState = container.store.get();
-      if (currentState !== lastState) {
-        lastState = currentState;
-        setState(currentState);
-      }
+    const syncFromStore = () => {
+      setState(container.store.get());
       // Surface any silent memory-pruning notice (M7) — consumed once, so the
       // banner never re-appears unless a NEW prune happens.
       const notice = container.store.consumePruneNotice();
       if (notice) setPruneNotice(notice);
-    }, 100); // Check every 100ms for external changes
-    return () => clearInterval(checkInterval);
+      // Same one-shot pattern for storage WRITE failures (audit round 1).
+      const writeErr = container.store.consumeWriteError();
+      if (writeErr) setStorageWriteError(writeErr);
+      // Chat-blob persist failures (audit round 2 — quota asymmetry).
+      const chatWriteErr = container.consumeChatWriteError();
+      if (chatWriteErr) setChatWriteError(chatWriteErr);
+    };
+    syncFromStore();
+    return container.store.subscribe(syncFromStore);
   }, []);
 
   // Keep "today" fresh if the app is left open across midnight
@@ -102,7 +113,7 @@ export function useAppState() {
   }
 
   function resetAll() {
-    if (confirm('Poora progress reset karna hai? Ye undo nahi ho sakta.')) {
+    if (confirm('Poora progress reset karna hai? Is code SARA progress — tareeqa, tasks, memory — delete ho jayega aur ye undo nahi ho sakta. Kya aap 100% sure hain?')) {
       update(() => emptyAppState());
     }
   }
@@ -137,5 +148,5 @@ export function useAppState() {
     setAdminDayState(day);
   }
 
-  return { state, today, update, refresh, startJourney, resetAll, adminUnlocked, adminDay, unlockAdmin, autoUnlock, lockAdmin, setAdminDay, pruneNotice, dismissPruneNotice: () => setPruneNotice(null) };
+  return { state, today, update, refresh, startJourney, resetAll, adminUnlocked, adminDay, unlockAdmin, autoUnlock, lockAdmin, setAdminDay, pruneNotice, dismissPruneNotice: () => setPruneNotice(null), storageWriteError, dismissStorageWriteError: () => setStorageWriteError(null), chatWriteError, dismissChatWriteError: () => setChatWriteError(null) };
 }

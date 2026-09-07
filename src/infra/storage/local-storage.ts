@@ -47,6 +47,14 @@ class PersistentKeyValueStore implements KeyValueRepository {
     // Save async but don't wait
     persistentStorage.set(key, value).catch(console.error);
   }
+
+  /** AUDIT FIX (round 1): surface underlying write failures (quota etc.).
+   *  The wrapper fire-and-forgets the persist; without this passthrough the
+   *  caller can never tell a disk write failed and data would silently be
+   *  lost on the next app restart. */
+  getLastWriteError(): string | null {
+    return persistentStorage.getLastWriteError();
+  }
 }
 
 export const persistentStore = new PersistentKeyValueStore();
@@ -81,6 +89,10 @@ export class BrowserStorage implements KeyValueRepository {
 
   setItem(key: string, value: string): void {
     this.asyncStore.setItem(key, value);
+  }
+
+  getLastWriteError(): string | null {
+    return this.asyncStore.getLastWriteError();
   }
 }
 

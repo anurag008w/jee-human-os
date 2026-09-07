@@ -127,6 +127,40 @@ export const ROMAN_SCRIPT_RULE =
   'SCRIPT (hard rule): hamesha ROMAN script me likho — Hindi/Marathi ko English/Latin letters me (Hinglish). Devanagari letters (द, ड, ण, ठ, ढ, ढ़, देवनागरी) kabhi mat use karo, aur na hi akshar jod kar fake/behuda words likho (jaise "ण डथ ठजडत्र डथडय"). Devanagari Hindi ya Marathi sirf TAB use karo jab user khud clearly bole "normal Hindi bolo" ya "Marathi bolo" — iske alawa hamesha Roman script. English words aur numbers normal use kar sakte ho.';
 
 /**
+ * The ONLY "stay quiet" token. When the assistant emits the exact string
+ * "[silence]", the app treats it as a no-op: it is never shown in chat, never
+ * shown in live transcripts/reasoning, never spoken, and never persisted.
+ * Anything else (any other text, any other token) is always shown and spoken
+ * normally. The user explicitly asked: this applies ONLY to "[silence]",
+ * nothing else.
+ */
+export const SILENCE_TOKEN = '[silence]';
+
+/** Case-insensitive match of the exact silence token (same word, any case). */
+export const SILENCE_TOKEN_RE = /\[silence\]/gi;
+
+/** Remove every "[silence]" token, collapse same-line whitespace, trim. */
+export function stripSilenceToken(text: string): string {
+  return text
+    .replace(SILENCE_TOKEN_RE, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+/** True when the text carries no real content — only "[silence]" tokens. */
+export function isPureSilenceToken(text: string): boolean {
+  return stripSilenceToken(text ?? '').length === 0;
+}
+
+/**
+ * System-level rule: writing "[silence]" means "no message, no voice". Reads
+ * like a hard rule so the model uses the token instead of filler small-talk or
+ * stage directions, in BOTH text chat and live voice mode.
+ */
+export const SILENCE_TOKEN_RULE =
+  'SILENCE TOKEN (hard rule): If you want to produce real silence — stay quiet without sending any message or speaking any words — reply with EXACTLY "[silence]" (that one token, nothing else, nothing around it). The app understands ONLY this exact token as "do not show, do not speak": such a reply is never displayed, never voiced and never saved; the student simply hears/witnesses a natural pause. Any other wording — "\\[silence\\]", "silence", "*silence*", "(silence)", "chup raho" etc. — does NOT count: write other text only when you actually want it shown and spoken. Anything meaningful you write is ALWAYS shown and spoken normally. While idling/observing, use "[silence]" instead of small talk; never announce the token itself.';
+
+/**
  * The previous (pre-Misa) persona. Sessions that still carry this exact
  * default are upgraded to the Misa persona on load; user-edited personas are
  * left untouched.
