@@ -17,6 +17,7 @@ import { LiveSilenceStateMachine } from './live-silence-state-machine';
 import { canRetryLiveConnection, isPermanentLiveConnectionError } from './live-connection-policy';
 import { relationshipManager } from '../../features/ai/relationship-state';
 import { proactiveAgentService } from '../../features/ai/proactive-agent.service';
+import { container } from '../../di/container';
 import { describeLastCall, loadLastTranscriptSnapshot, loadLiveCallHistory, recordLiveCall } from './live-call-history';
 import { DEFAULT_LIVE_FALLBACK_MODELS } from './live-types';
 
@@ -481,19 +482,26 @@ ${this.recentChatSummary}
 
     const is90Day = this.config.enable90DayTrack !== false;
 
-    const allToolDeclarations = [
-      // 1. Google Web Search & Current Info
-      {
-        name: "webSearch",
-        description: "Search Google and live web for latest JEE Main/Advanced dates, NTA notices, exam announcements, news, cutoffs, syllabus updates, facts, and live real-time information.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            query: { type: "STRING", description: "Search query to look up on Google" },
-          },
-          required: ["query"],
+    // Web Search tool is gated by the SAME existing setting chat uses
+    // (`aiSettings.websearch.enabled`), NOT by the proactive-agent toggle.
+    const webSearchEnabled = container.store.get().aiSettings.websearch.enabled === true;
+
+    // 1. Google Web Search & Current Info — linked to the app's Web Search setting.
+    const webSearchDeclaration = {
+      name: "webSearch",
+      description: "Search Google and live web for latest JEE Main/Advanced dates, NTA notices, exam announcements, news, cutoffs, syllabus updates, facts, and live real-time information.",
+      parameters: {
+        type: "OBJECT",
+        properties: {
+          query: { type: "STRING", description: "Search query to look up on Google" },
         },
+        required: ["query"],
       },
+    };
+
+    // Core live-call tools: always available on a call, independent of the
+    // proactive-agent and web-search toggles.
+    const coreToolDeclarations = [
       // 2. Real-time Clock & Date
       {
         name: "getTime",
@@ -832,6 +840,37 @@ ${this.recentChatSummary}
           required: ["blockId"],
         },
       },
+      {
+        name: "editBlock",
+        description: "Edit a custom study block's metadata or dates (name, description, dayStart, dayEnd, days, difficulty, goals, habits).",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            blockId: { type: "STRING", description: "ID of the block to edit" },
+            name: { type: "STRING", description: "Updated name of the block" },
+            description: { type: "STRING", description: "Updated description" },
+            dayStart: { type: "INTEGER", description: "New start day (>=91)" },
+            dayEnd: { type: "INTEGER", description: "New end day (>=91)" },
+            days: { type: "INTEGER", description: "New duration in days" },
+            difficulty: { type: "STRING", description: "easy, medium, hard, extreme" },
+            goals: { type: "ARRAY", items: { type: "STRING" }, description: "Updated goals" },
+            habits: { type: "ARRAY", items: { type: "STRING" }, description: "Updated habits" },
+          },
+          required: ["blockId"],
+        },
+      },
+      {
+        name: "extendBlock",
+        description: "Extend a custom study block by adding more days to its end.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            blockId: { type: "STRING", description: "ID of the block to extend" },
+            days: { type: "INTEGER", description: "Number of days to add" },
+          },
+          required: ["blockId", "days"],
+        },
+      },
       // 8. Uploaded Coaching Planners, Tests & Routine
       {
         name: "listPlanners",
@@ -875,6 +914,42 @@ ${this.recentChatSummary}
           type: "OBJECT",
           properties: {
             day: { type: "STRING", description: "Optional day name (e.g. Monday, Tuesday)" },
+          },
+        },
+      },
+      {
+        name: "getTest",
+        description: "Get details of a specific mock test (date, pattern, syllabus) from the coaching test planner.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            testName: { type: "STRING", description: "Name of the test (e.g. AIATS 01, Mega Mock 3)" },
+          },
+          required: ["testName"],
+        },
+      },
+      {
+        name: "getPlanner",
+        description: "Get the full content of one specific coaching planner (subject, test, or routine) by its id.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            plannerId: { type: "STRING", description: "ID of the planner (from listPlanners)" },
+            from: { type: "STRING", description: "Start date or chapter filter" },
+            to: { type: "STRING", description: "End date or chapter filter" },
+          },
+          required: ["plannerId"],
+        },
+      },
+      {
+        name: "getDay",
+        description: "Get a specific day's coaching planner details by date (or date range).",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            date: { type: "STRING", description: "Date (e.g. 2026-08-30)" },
+            from: { type: "STRING", description: "Start date filter" },
+            to: { type: "STRING", description: "End date filter" },
           },
         },
       },
@@ -922,6 +997,51 @@ ${this.recentChatSummary}
             value: { type: "STRING", description: "Fact or note to remember" },
           },
           required: ["key", "value"],
+        },
+      },
+      {
+        name: "editMemory",
+        description: "Edit an existing memory entry's content.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            id: { type: "STRING", description: "ID of the memory entry to edit" },
+            content: { type: "STRING", description: "New content for the memory entry" },
+          },
+          required: ["id", "content"],
+        },
+      },
+      {
+        name: "deleteMemory",
+        description: "Delete a memory entry. Ask for the student's spoken confirmation before deleting.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            id: { type: "STRING", description: "ID of the memory entry to delete" },
+          },
+          required: ["id"],
+        },
+      },
+      {
+        name: "pinMemory",
+        description: "Pin a memory entry to long-term memory so it is always prioritized.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            id: { type: "STRING", description: "ID of the memory entry to pin" },
+          },
+          required: ["id"],
+        },
+      },
+      {
+        name: "unpinMemory",
+        description: "Unpin a memory entry from long-term memory.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            id: { type: "STRING", description: "ID of the memory entry to unpin" },
+          },
+          required: ["id"],
         },
       },
       // 10. Chat History Search & Sessions
@@ -1002,59 +1122,65 @@ ${this.recentChatSummary}
           },
         },
       },
-      // 13. Proactive scheduling (only when the student explicitly asks)
-      {
-        name: "scheduleMessage",
-        description: "Schedule a reminder message for a future time (only when the student explicitly asks, e.g. 'kal 5 baje yaad dilana').",
-        parameters: {
-          type: "OBJECT",
-          required: ["text", "scheduledAtISO"],
-          properties: {
-            text: { type: "STRING", description: "Reminder message text" },
-            scheduledAtISO: { type: "STRING", description: "ISO-8601 future timestamp" },
-            topic: { type: "STRING", description: "Optional topic/tag" },
-          },
-        },
-      },
-      {
-        name: "scheduleCall",
-        description: "Schedule a voice-call check-in for a future time (only when the student explicitly asks).",
-        parameters: {
-          type: "OBJECT",
-          required: ["reason", "scheduledAtISO"],
-          properties: {
-            reason: { type: "STRING", description: "Call reason" },
-            scheduledAtISO: { type: "STRING", description: "ISO-8601 future timestamp" },
-          },
-        },
-      },
-      {
-        name: "makeCall",
-        description: "Call the student right now (only when the student explicitly asks you to call them).",
-        parameters: {
-          type: "OBJECT",
-          required: ["reason"],
-          properties: {
-            reason: { type: "STRING", description: "Call reason" },
-          },
-        },
-      },
-      {
-        name: "listScheduled",
-        description: "List currently pending scheduled messages/calls.",
-        parameters: { type: "OBJECT", properties: {} },
-      },
-      {
-        name: "cancelScheduled",
-        description: "Cancel a scheduled message/call by id.",
-        parameters: {
-          type: "OBJECT",
-          required: ["id"],
-          properties: {
-            id: { type: "STRING", description: "Scheduled item id" },
-          },
-        },
-      },
+    ];
+
+    // 13. Proactive scheduling tools — only when the proactive agent is enabled.
+    // NOTE: makeCall was intentionally removed from live declarations (the
+    // student must place a call themselves; Misa should not autonomously dial).
+    const proactiveToolDeclarations = isProactiveEnabled
+        ? [
+            {
+              name: "scheduleMessage",
+              description: "Schedule a reminder message for a future time (only when the student explicitly asks, e.g. 'kal 5 baje yaad dilana').",
+              parameters: {
+                type: "OBJECT",
+                required: ["text", "scheduledAtISO"],
+                properties: {
+                  text: { type: "STRING", description: "Reminder message text" },
+                  scheduledAtISO: { type: "STRING", description: "ISO-8601 future timestamp" },
+                  topic: { type: "STRING", description: "Optional topic/tag" },
+                },
+              },
+            },
+            {
+              name: "scheduleCall",
+              description: "Schedule a voice-call check-in for a future time (only when the student explicitly asks).",
+              parameters: {
+                type: "OBJECT",
+                required: ["reason", "scheduledAtISO"],
+                properties: {
+                  reason: { type: "STRING", description: "Call reason" },
+                  scheduledAtISO: { type: "STRING", description: "ISO-8601 future timestamp" },
+                },
+              },
+            },
+            {
+              name: "listScheduled",
+              description: "List currently pending scheduled messages/calls.",
+              parameters: { type: "OBJECT", properties: {} },
+            },
+            {
+              name: "cancelScheduled",
+              description: "Cancel a scheduled message/call by id.",
+              parameters: {
+                type: "OBJECT",
+                required: ["id"],
+                properties: {
+                  id: { type: "STRING", description: "Scheduled item id" },
+                },
+              },
+            },
+          ]
+        : [];
+
+    // Assemble the final tool set from three independent gates:
+    //  - webSearch  → aiSettings.websearch.enabled (existing Web Search setting)
+    //  - core        → always available on a live call
+    //  - proactive   → proactiveAgentService prefs enabled
+    const allToolDeclarations = [
+      ...(webSearchEnabled ? [webSearchDeclaration] : []),
+      ...coreToolDeclarations,
+      ...proactiveToolDeclarations,
     ];
 
     try {
@@ -1080,15 +1206,25 @@ ${this.recentChatSummary}
           // pass { thinkingBudget: 0 } to force thinking OFF. Gemini 2.x native
           // audio models default thinking ON when the field is omitted, which
           // leaks internal reasoning ("thinking box") into the transcript/audio.
-          thinkingConfig: {
-            ...(this.config.thinkingBudget !== undefined && this.config.thinkingBudget > 0
-              ? { thinkingBudget: this.config.thinkingBudget }
-              : { thinkingBudget: 0 }),
-          },
+          //
+          // When thinking IS enabled we ALSO send `includeThoughts: true`
+          // (mirroring the non-live chat path in gemini.ts). Omitting it lets
+          // the model spend the budget internally but send its reasoning back
+          // as UNFLAGGED plain text parts (not `thought: true`), which then
+          // leaked into the spoken transcript/message instead of the thinking
+          // box. With includeThoughts the reasoning arrives flagged and the
+          // handler below routes it into `pendingReasoning` → the box.
+          thinkingConfig:
+            this.config.thinkingBudget !== undefined && this.config.thinkingBudget > 0
+              ? { thinkingBudget: this.config.thinkingBudget, includeThoughts: true }
+              : { thinkingBudget: 0 },
           systemInstruction: {
             parts: [{ text: fullSystemInstruction }],
           },
-          ...(isProactiveEnabled ? { tools: [{ functionDeclarations: allToolDeclarations as any }] } : {}),
+          // Tools are ALWAYS attached: the core live-call tools must be available
+          // even when the proactive agent is disabled. Only webSearch and the
+          // proactive scheduling tools are independently gated (assembled above).
+          tools: [{ functionDeclarations: allToolDeclarations as any }],
         },
         callbacks: {
           onopen: () => {
