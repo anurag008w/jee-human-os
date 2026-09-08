@@ -15,11 +15,19 @@ if [[ "$1" == "--dry-run" ]]; then
     shift
 fi
 
-# Get version from argument or generate from date
+# Get version from argument or auto-next BUILD-scheme (kabhi plain-date nahi —
+# plain-date tag build-number tag ke baad versionCode GHATA deta hai aur
+# Android ki downgrade protection update install hone se rok deti hai).
 if [ -n "$1" ]; then
     VERSION="$1"
 else
-    VERSION="v$(date +%Y.%m.%d)"
+    LATEST_BUILD_TAG=$(git tag --list 'v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9][0-9][0-9]' | sort -V | tail -1 || true)
+    if [ -z "$LATEST_BUILD_TAG" ]; then
+        VERSION="v$(date +%Y.%m.)7000"
+    else
+        NEXT_BUILD=$(( "${LATEST_BUILD_TAG##*.}" + 1 ))
+        VERSION="v$(date +%Y.%m.)${NEXT_BUILD}"
+    fi
 fi
 
 # Ensure version starts with 'v'

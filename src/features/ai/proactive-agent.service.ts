@@ -64,8 +64,6 @@ export interface ProactiveTrigger {
   offlineMessage: string;
   callReason?: string;
   requiresOnline?: boolean;
-  /** DND-deferred delivery kitni baar retry ho chuki (cap lagata hai). */
-  deliveryRetries?: number;
 }
 
 /** AI tools (scheduleMessage/makeCall) se banaya gaya scheduled item. */
@@ -615,6 +613,10 @@ class ProactiveAgentService {
       // hota hai. DND/quiet-time pehle hi line 587 par early-return karke
       // trigger ko pending hi rakhta hai (kabhi remove nahi karta) → DND khatam
       // hote hi agli poll par deliver; bounded retry ki koi zaroorat nahi.
+      // NOTE: remove kiye gaye `relState.boundaries.dndUntilTimestamp` branch
+      // ki wajah distribution-field dead thi: boundaries field production me
+      // kabhi write nahi hota (sirf default 0) — DND service field me rehta
+      // hai jo isQuietTime() line 587 pe already check karta hai.
 
       const validation = validateProactiveDelivery(
         {

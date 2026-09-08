@@ -477,7 +477,12 @@ export default function LiveCompanionOverlay({
       if (!keepMic) mic.getTracks().forEach((t) => t.stop());
       cam?.getTracks().forEach((t) => t.stop());
       c.disconnect();
-      if (activeLiveClient === c) activeLiveClient = null;
+      if (activeLiveClient === c) {
+        activeLiveClient = null;
+        // Same tick me flag bhi clear — startup-failure path par chat routing
+        // ko kabhi "call active + client missing" na dikhe (handleEndCall jaisa).
+        setLiveCallActive(false);
+      }
       // Global FGS teardown is SHARED + generation-scoped: if a newer overlay
       // (a fresh call) has already armed the service during our cleanup, we
       // must NOT stop it. Only the newest mount may tear down the shared FGS.
