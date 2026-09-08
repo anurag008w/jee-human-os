@@ -60,6 +60,17 @@ import { resetNativeAudioRoute } from '../../lib/native-audio-route';
 // instance. Navigation/minimising may unmount the observer without hanging up.
 let activeLiveClient: GeminiLiveClient | null = null;
 
+/**
+ * Active live-call client handle (module runtime). ChatScreen isha use karta
+ * hai jab live call active ho (PiP bubble / overlay open): chat composer ka
+ * text yahan route hota hai taaki "call chalu + chat me type kiya" do alag
+ * conversations na ban jaayein — plain text direct Gemini Live session me
+ * jaata hai, normal chat LLM call nahi chalti.
+ */
+export function getActiveLiveClient(): GeminiLiveClient | null {
+  return activeLiveClient;
+}
+
 // Ever-increasing overlay generation. Every overlay mount captures `++overlayEpoch`
 // as its own epoch. Global native teardown calls (stopLiveCompanionService,
 // clearLiveCallInterrupted) are SHARED — a stale/cancelled mount must never tear

@@ -76,7 +76,8 @@ import {
 import type { LiveSettingsConfig, LiveTranscriptItem, LiveCallOrigin } from '../core/domain/live-types';
 import { DEFAULT_LIVE_SETTINGS } from '../core/domain/live-types';
 import LivePermissionModal from '../components/live/LivePermissionModal';
-import LiveCompanionOverlay from '../components/live/LiveCompanionOverlay';
+import LiveCompanionOverlay, { getActiveLiveClient } from '../components/live/LiveCompanionOverlay';
+import { isLiveCallActive } from '../features/ai/live-call-state';
 import { requestNativeCallAudioFocus, setNativeAudioRoute, resetNativeAudioRoute, isNativeAudioPlatform } from '../lib/native-audio-route';
 import { isLiveCallInterrupted, clearLiveCallInterrupted } from '../lib/live-companion-service';
 import { normalizeServerRoot } from '../lib/auth';
@@ -1332,6 +1333,26 @@ export default function ChatScreen({
     const pendingAttachments = attachments;
     const text = buildPromptWithAttachments(pendingDraft.trim(), pendingAttachments);
     if (!text || streaming) return;
+
+    // LIVE CALL routing (user: "call chalu ho toh chat me type kiya message
+    // call me hi jaye, confusion na ho"). Jab live call active hai (PiP bubble
+    // ya overlay open) toh chat composer ka PLAIN text direct Gemini Live
+    // session me jaata hai — normal chat LLM streaming nahi chalti (nahi toh
+    // do alag conversations ban jaati hain). handleLiveTranscriptUpdate yahi
+    // text baad me session me dikha deta hai, isliye koi loss nahi.
+    // Attachments / edit / @tools advanced flows normal chat me hi rehte hain.
+    if (pendingAttachments.length === 0 && !editing && isLiveCallActive()) {
+      const live = getActiveLiveClient();
+      if (live) {
+        live.sendTextMessage(pendingDraft.trim(), pendingDraft.trim());
+        setDraft('');
+        setToolMentions([]);
+        setShowAttach(false);
+        haptic();
+        return;
+      }
+    }
+
     const s = ensureSession();
     const editTarget = editing && editing.sessionId === s.id ? editing : null;
     setShowAttach(false);
@@ -1739,6 +1760,9 @@ export default function ChatScreen({
     // while the user is actively composing a message. Throttled internally
     // (saveState once per 20 s) so there's no localStorage churn per keystroke.
     proactiveAgentService.recordTyping();
+    // Live call chalu ho toh typing live session ki activity hai — silence
+    // observer restart karo taaki mid-composition "arey suno?" na aaye.
+    if (isLiveCallActive()) getActiveLiveClient()?.reportUserTyping();
   }
 
   /** Pins a tool from the "@" picker: strips the "@query" text and adds a chip. */
@@ -2039,7 +2063,11 @@ export default function ChatScreen({
               value={draft}
               onChange={(e) => handleDraftChange(e.target.value)}
               onKeyDown={keydown}
-              placeholder="Maths, doubts ya notes likho… (@ se tools select karo)"
+              placeholder={
+                isLiveCallActive()
+                  ? 'Live call me bhejo — text direct call me jaayega…'
+                  : 'Maths, doubts ya notes likho… (@ se tools select karo)'
+              }
               className="max-h-36 min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-[14px] leading-snug text-text outline-none placeholder:text-muted-dim"
               aria-label="Message"
             />
@@ -2067,9 +2095,14 @@ export default function ChatScreen({
                 type="button"
                 onClick={() => void send()}
                 className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-l transition-transform active:scale-90"
-                aria-label={editing ? 'Send edited message' : 'Send message'}
+                aria-label={isLiveCallActive() ? 'Send to live call' : editing ? 'Send edited message' : 'Send message'}
+                title={isLiveCallActive() ? 'Text call me jaayega' : undefined}
               >
-                <Send size={17} color="var(--color-ink)" />
+                {isLiveCallActive() ? (
+                  <Phone size={17} color="var(--color-ink)" />
+                ) : (
+                  <Send size={17} color="var(--color-ink)" />
+                )}
               </button>
             )}
           </div>
