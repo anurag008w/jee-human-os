@@ -12,7 +12,7 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -50,11 +50,8 @@ public class GaplessAudioTrackPlugin extends Plugin {
     private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_OUT_MONO;
     private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
 
-    /** Writer thread drain loop sleep when the queue is empty (idle backoff). */
-    private static final int DRAIN_IDLE_SLEEP_MS = 10;
-
     private AudioTrack audioTrack;
-    private final ConcurrentLinkedQueue<short[]> pending = new ConcurrentLinkedQueue<>();
+    private final LinkedBlockingQueue<short[]> pending = new LinkedBlockingQueue<>();
     private Thread writerThread;
     private final AtomicBoolean closed = new AtomicBoolean(true);
 
@@ -102,7 +99,15 @@ public class GaplessAudioTrackPlugin extends Plugin {
 
             audioTrack.play();
 
-            writerThread = new Thread(this::drainLoop, "gapless-audio-writer");
+            // Writer thread: blocking AudioTrack.write() runs on its own thread so
+            // the JS bridge never stalls. THREAD_PRIORITY_AUDIO raises the Linux
+            // nice level so the OS schedules the writer tightly — the DAC never
+            // underruns even under WebView main-thread / GC load, which is what
+            // used to drop chunks and produce the "atak atak" stutter.
+            writerThread = new Thread(() -> {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+                drainLoop();
+            }, "gapless-audio-writer");
             writerThread.start();
 
             JSObject ret = new JSObject();
@@ -199,18 +204,23 @@ public class GaplessAudioTrackPlugin extends Plugin {
         }
     }
 
-    /** Writer loop: blocking write() to the AudioTrack for true gapless output. */
+    /**
+     * Writer loop: blocking write() to the AudioTrack for true gapless output.
+     *
+     * Uses LinkedBlockingQueue.take() (not sleep-polling) so the writer wakes
+     * the INSTANT a chunk arrives — no 10ms idle poll lag. The OS audio sink
+     * glues consecutive blocking writes together, so there are none of the
+     * per-chunk DAC boundaries that WebAudio's AudioBufferSourceNode chaining
+     * produces. Combined with THREAD_PRIORITY_AUDIO the writer is scheduled
+     * tightly enough to keep the buffer fed even under main-thread load.
+     */
     private void drainLoop() {
         while (!closed.get()) {
-            short[] chunk = pending.poll();
-            if (chunk == null) {
-                try {
-                    // Idle: nothing queued, repo the writer thread a moment.
-                    Thread.sleep(DRAIN_IDLE_SLEEP_MS);
-                } catch (InterruptedException ie) {
-                    return;
-                }
-                continue;
+            short[] chunk;
+            try {
+                chunk = pending.take(); // blocks until data — instant wakeup
+            } catch (InterruptedException ie) {
+                return;
             }
             AudioTrack t = audioTrack;
             if (t == null || t.getState() != AudioTrack.STATE_INITIALIZED) {

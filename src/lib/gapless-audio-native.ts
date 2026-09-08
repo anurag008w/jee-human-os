@@ -25,20 +25,22 @@ interface GaplessAudioTrackNative {
 const Native = registerPlugin<GaplessAudioTrackNative>('GaplessAudioTrack');
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Native gapless path is OPT-IN.
+// Native gapless path is ENABLED.
 //
-// The rewrite to fix the "no voice on native" regression (a USAGE_MEDIA
-// AudioTrack was being silenced by the live call's voice-communication
-// AUDIOFOCUS_GAIN — fixed back to USAGE_VOICE_COMMUNICATION in the plugin) is
-// shipped in `GaplessAudioTrackPlugin.java`, BUT the native output still cannot
-// be verified here (no on-device build). To NEVER again ship a release where
-// the companion is silent, the proven WebAudio path stays the DEFAULT and the
-// native gapless stream must be explicitly enabled before playout.
+// AudioTrack MODE_STREAM + USAGE_VOICE_COMMUNICATION is the only way to get
+// truly gapless PCM output on Android — the OS audio sink glues consecutive
+// writes together, eliminating per-chunk DAC boundaries that WebAudio's
+// AudioBufferSourceNode chaining produces ("atak atak" stutter).
 //
-// Flip to `true` ONLY after the native AudioTrack is confirmed audible on a
-// real device (live call, large reply) — i.e. post `npx cap sync` + build.
+// First chunk still falls through to WebAudio (ensureNativeAudioTrack is
+// async), but subsequent chunks route through native. If the native plugin
+// fails to open, the flag stays false and WebAudio continues as silent
+// fallback — zero risk of breaking existing playback.
+//
+// Previously disabled after a USAGE_MEDIA → USAGE_VOICE_COMMUNICATION
+// audio-focus regression. That is fixed; the flag is now enabled.
 // ═══════════════════════════════════════════════════════════════════════════
-export const NATIVE_GAPLESS_ENABLED = false;
+export const NATIVE_GAPLESS_ENABLED = true;
 
 /** True when we are running on a real native Android build. */
 function isNative(): boolean {

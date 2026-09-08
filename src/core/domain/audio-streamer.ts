@@ -57,7 +57,7 @@ export class AudioStreamer {
   private static readonly PRE_ROLL_MS = 60; // small initial lead so the DAC ramps smoothly
   private static readonly MIN_CHAIN_LEAD_MS = 20; // never schedule a burst dead-on `now`
   private static readonly SCHEDULE_AHEAD_SECONDS = 1.2; // keep ~1.2s of audio pre-scheduled
-  private static readonly STARTUP_BUFFER_COUNT = 1; // start as soon as the first chunk is decoded
+  private static readonly STARTUP_BUFFER_COUNT = 3; // hold ~400ms (3×133ms) before cold start so pehle ke words cutte nahi
   // ── Adaptive weak-network buffering (low-bandwidth voice fix) ──
   // On a slow link the server's audio chunks arrive in bursts with silent gaps.
   // We LEARN the link is weak (repeated playback under-runs) and then:

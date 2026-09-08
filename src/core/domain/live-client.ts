@@ -1421,8 +1421,15 @@ If the student typed new messages during the drop, reply ONLY to those when they
           const whenText = recentCall
             ? `${diffSec}s pehle`
             : lastCallDesc?.text ?? 'kuch der pehle';
+          // Only mention the cumulative count at milestone numbers (5, 10, 25, 50, 100).
+          // Mentioning it on EVERY redial made Misa repeat "ohoo kitne call kroge" every
+          // single time — annoying and repetitive. Milestones are natural checkpoints
+          // where the count genuinely matters ("ab 10 calls ho gayi!").
+          const milestones = new Set([5, 10, 25, 50, 100]);
           const callCountText =
-            totalCalls >= 2 ? ` Aur overall ab tak aapki ${totalCalls} call ho chuki hain — yeh thodi normal baat-chit ka hissa hai, casually acknowledge karo agar natural lage.` : '';
+            milestones.has(totalCalls)
+              ? ` Aur overall ab tak aapki ${totalCalls} call ho chuki hain — casually acknowledge milestone naturally if it fits.`
+              : '';
 
           if (recentCall && hadUserHangup) {
             this.session?.sendRealtimeInput({

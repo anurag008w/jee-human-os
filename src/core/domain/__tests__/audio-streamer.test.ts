@@ -141,13 +141,17 @@ async function loadStreamer() {
 }
 
 describe('AudioStreamer jitter-buffer scheduling', () => {
-  it('starts playback as soon as the first chunk is decoded (no long startup wait)', async () => {
+  it('holds cold start until STARTUP_BUFFER_COUNT chunks are queued, then starts gaplessly', async () => {
     await loadStreamer();
     const streamer = new AudioStreamer();
-    // STARTUP_BUFFER_COUNT=1: a single decoded chunk is enough to open the chain.
-    streamer.playAudioChunk(toPcm24kBase64(new Float32Array((0.2 * 24000) | 0)));
-    flushTimers();
-    expect(startCalls.length).toBe(1);
+    // STARTUP_BUFFER_COUNT=3: first 2 chunks queue up (cold start holds).
+    // The 3rd chunk triggers the drain and schedules all 3 at once.
+    for (let i = 0; i < 3; i++) {
+      streamer.playAudioChunk(toPcm24kBase64(new Float32Array((0.2 * 24000) | 0)));
+      flushTimers();
+    }
+    // All 3 decoded chunks should now be scheduled (coalesced into one drain pass).
+    expect(startCalls.length).toBe(3);
     void streamer;
   });
 
