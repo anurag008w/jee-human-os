@@ -13,7 +13,7 @@ import type { AppState } from '../../../core/domain/state';
 import { emptyAppState } from '../../../core/domain/state';
 import type { ChatRepository, StateStore } from '../../../core/ports/repositories';
 import type { ChatStoreState } from '../../../core/domain/chat';
-import type { ContentPart, LLMProvider, LLMResponse, HealthCheckResult, ModelInfo, LLMRequest, ProviderId } from '../../../core/domain/llm';
+import type { LLMProvider, LLMResponse, HealthCheckResult, ModelInfo, LLMRequest, ProviderId } from '../../../core/domain/llm';
 import type { ProviderFactory } from '../../../infra/ai/provider-factory';
 import { LLMService } from '../../../features/ai/llm.service';
 import { ProviderSettingsService } from '../../../features/ai/provider-settings.service';
