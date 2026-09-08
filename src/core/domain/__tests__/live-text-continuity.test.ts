@@ -20,7 +20,7 @@ import { ProviderSettingsService } from '../../../features/ai/provider-settings.
 import { ChatService } from '../../../features/chat/chat.service';
 import { GeminiLiveClient } from '../live-client';
 import type { LiveSettingsConfig } from '../live-types';
-import { recordLiveCall, setLastTranscriptSnapshot, setLiveCallHistoryStorage } from '../live-call-history';
+import { recordLiveCall, setLastTranscriptSnapshot, setLiveCallHistoryStorage, loadLiveCallHistory } from '../live-call-history';
 
 class MemoryChatRepository implements ChatRepository {
   private state: ChatStoreState = { version: 1, sessions: [] };
@@ -203,6 +203,42 @@ describe('live text continuity (chat → call context)', () => {
       expect(systemText).toContain('Aapki live-call history');
       expect(systemText).toContain('Total 2 live calls');
       expect(systemText).toContain('u aur v'); // last-call transcript tail available too
+    } finally {
+      setLiveCallHistoryStorage(null);
+    }
+  });
+
+  it('deleting a CHAT purges its call history — "chat delete kiya fir bhi call count yaad" is fixed', () => {
+    const map = new Map<string, string>();
+    const stub = {
+      getItem: (k: string) => map.get(k) ?? null,
+      setItem: (k: string, v: string) => { void map.set(k, v); },
+      removeItem: (k: string) => { void map.delete(k); },
+    };
+    setLiveCallHistoryStorage(stub);
+    try {
+      const { chat } = buildChatService();
+      const s1 = chat.createSession();
+      const s2 = chat.createSession();
+
+      // Two live calls happened inside chat s1; the latest one's transcript
+      // tail is persisted (would leak "last call me kya hua").
+      recordLiveCall(Date.now() - 3_600_000, 120, { sessionId: s1.id });
+      recordLiveCall(Date.now() - 1_800_000, 60, {
+        sessionId: s1.id,
+        updateTranscriptSnapshot: () => ['Student: plan bana do', 'Misa: 30 min ka plan hai'],
+      });
+      // ONE unrelated call in chat s2 must survive.
+      recordLiveCall(Date.now() - 900_000, 45, { sessionId: s2.id });
+
+      chat.deleteSession(s1.id);
+
+      const h = loadLiveCallHistory();
+      expect(h.totalCalls).toBe(1);
+      expect(h.recent).toHaveLength(1);
+      expect(h.recent[0].sessionId).toBe(s2.id);
+      // The deleted chat's transcript tail is forgotten too.
+      expect(h.lastTranscriptSnapshot).toEqual([]);
     } finally {
       setLiveCallHistoryStorage(null);
     }

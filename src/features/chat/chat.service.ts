@@ -45,7 +45,7 @@ import type { ChatToolsService } from './chat-tools.service';
 import type { MemoryToolsService } from './memory-tools.service';
 import { MEMORY_TOOL_INSTRUCTIONS } from '../../core/domain/memory-tools';
 import type { MemoryToolResult, MemoryToolAction } from '../../core/domain/memory-tools';
-import { buildLiveCallOverview } from '../../core/domain/live-call-history';
+import { buildLiveCallOverview, purgeLiveCallsForSession } from '../../core/domain/live-call-history';
 import type { WebSearchService, WebSearchContext } from '../../infra/ai/websearch.service';
 import type { WebSearchSettings } from '../../core/domain/state';
 
@@ -366,6 +366,15 @@ export class ChatService {
       } catch {
         // Best-effort memory cleanup — deletion must still succeed.
       }
+    }
+    // Deleting a chat also purges its persisted CALL history (session-keyed in
+    // loadLiveCallHistory). Otherwise Misa would keep recollecting "Total N live
+    // calls hui hain" from a chat the user already deleted ("chat delete kiya
+    // fir bhi call count yaad hai").
+    try {
+      purgeLiveCallsForSession(id);
+    } catch {
+      // Best-effort — call history is a side store; deletion must still succeed.
     }
     state.sessions = state.sessions.filter((s) => s.id !== id);
     this.repo.save(state);

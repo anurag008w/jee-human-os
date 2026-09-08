@@ -14,6 +14,7 @@ import {
   loadLastTranscriptSnapshot,
   describeLastCall,
   buildLiveCallOverview,
+  purgeLiveCallsForSession,
   MAX_CALL_LOG,
   setLiveCallHistoryStorage,
 } from '../live-call-history';
@@ -146,5 +147,60 @@ describe('buildLiveCallOverview (AI context injection)', () => {
   it('tolerates corrupt storage (empty overview, no crash)', () => {
     storage.setItem('levelup.live.call_history', '{not valid json');
     expect(buildLiveCallOverview(now)).toBe('');
+  });
+});
+
+describe('purgeLiveCallsForSession (chat deletion forgets its calls)', () => {
+  it('removes ONLY the deleted session\'s calls and decrements totalCalls', () => {
+    recordLiveCall(10_001, 60, { sessionId: 'chatA' });
+    recordLiveCall(20_002, 90, { sessionId: 'chatA' });
+    recordLiveCall(30_003, 120, { sessionId: 'chatB' });
+
+    const removed = purgeLiveCallsForSession('chatA');
+
+    expect(removed).toBe(2);
+    const h = loadLiveCallHistory();
+    expect(h.totalCalls).toBe(1);
+    expect(h.recent).toHaveLength(1);
+    expect(h.recent[0].sessionId).toBe('chatB');
+  });
+
+  it('clears the transcript snapshot when its producing call is purged', () => {
+    recordLiveCall(50_000, 120, {
+      sessionId: 'chatA',
+      updateTranscriptSnapshot: () => ['Student: plan bana do', 'Misa: 30 min ka plan...'],
+    });
+
+    purgeLiveCallsForSession('chatA');
+
+    expect(loadLiveCallHistory().lastTranscriptSnapshot).toEqual([]);
+    expect(loadLiveCallHistory().lastTranscriptSnapshotAt).toBeUndefined();
+  });
+
+  it('keeps the snapshot when a NON-most-recent call is purged', () => {
+    recordLiveCall(10_000, 60, { sessionId: 'chatOld' });
+    setLastTranscriptSnapshot(['Misa: fresh call words']);
+    recordLiveCall(20_000, 40, { sessionId: 'chatNew' });
+
+    purgeLiveCallsForSession('chatOld');
+
+    expect(loadLiveCallHistory().lastTranscriptSnapshot).toEqual(['Misa: fresh call words']);
+    expect(loadLiveCallHistory().totalCalls).toBe(1);
+  });
+
+  it('legacy records without sessionId are never purged; unknown session is a no-op', () => {
+    recordLiveCall(10_000, 60); // no sessionId (legacy)
+    expect(purgeLiveCallsForSession('ghost')).toBe(0);
+    expect(loadLiveCallHistory().totalCalls).toBe(1);
+
+    expect(purgeLiveCallsForSession('')).toBe(0);
+    expect(loadLiveCallHistory().totalCalls).toBe(1);
+  });
+
+  it('overview goes fully empty after the last calls are purged', () => {
+    recordLiveCall(10_000, 60, { sessionId: 'chatA' });
+    recordLiveCall(20_000, 45, { sessionId: 'chatA' });
+    purgeLiveCallsForSession('chatA');
+    expect(buildLiveCallOverview()).toBe('');
   });
 });

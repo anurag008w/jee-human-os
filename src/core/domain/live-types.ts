@@ -156,6 +156,14 @@ export interface LiveTranscriptItem {
   reasoning?: string;
 }
 
+/**
+ * SmartRotator LIVE WebSocket relay root (no /v1, no trailing slash). The
+ * live-call base URL uses THIS dedicated relay — NOT the normal login/API
+ * server root (smartrotator.onrender.com), which stays untouched for auth,
+ * LLM and web-search traffic. "sirf live wala" change.
+ */
+export const SMARTROTATOR_LIVE_RELAY_BASE_URL = 'https://smartrotator-relay.anuragwankhede988.workers.dev';
+
 export interface LiveSettingsConfig {
   providerId?: string; // e.g. 'app-default', 'gemini', 'custom', or stored provider id
   apiKey?: string;
@@ -185,6 +193,12 @@ export interface LiveSettingsConfig {
    * client falls back to the built-in default chain.
    */
   fallbackModels?: string[];
+  /**
+   * Chat session this call belongs to. Lets the persisted call history be
+   * purged when the user deletes that chat — otherwise Misa would keep saying
+   * "Total N live calls hui hain" after the chat (and its calls) were deleted.
+   */
+  sessionId?: string;
 }
 
 export const DEFAULT_LIVE_SETTINGS: LiveSettingsConfig = {

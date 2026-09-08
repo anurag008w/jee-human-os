@@ -74,6 +74,8 @@ export class GeminiLiveClient {
   private userPersona = '';
   private memoryContext = '';
   private recentChatSummary = '';
+  /** Chat session this call belongs to (see LiveSettingsConfig.sessionId). */
+  private sessionId?: string;
 
   /** Hang-fix P4: cap the in-call transcript so an unlimited call can never
    *  grow the array + per-chunk `[...this.transcripts]` copy unbounded. The UI
@@ -131,6 +133,7 @@ export class GeminiLiveClient {
 
   constructor(config: LiveSettingsConfig, callbacks: LiveClientCallbacks = {}) {
     this.config = config;
+    this.sessionId = config.sessionId || undefined;
     this.callbacks = callbacks;
     this.audioStreamer = new AudioStreamer();
     if (config.playbackSpeed) {
@@ -3355,9 +3358,12 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
       // disconnect (hadLiveSession) — a stale module global from a previous
       // call must never be re-recorded by a failed/phantom teardown.
       if (hadLiveSession && globalLastCallEndedAt > 0) {
-        recordLiveCall(globalLastCallEndedAt, globalLastCallDurationSec, (prev) => {
-          const next = this.lastCallTranscriptSnapshot;
-          return next.length > 0 ? next : prev;
+        recordLiveCall(globalLastCallEndedAt, globalLastCallDurationSec, {
+          sessionId: this.sessionId || undefined,
+          updateTranscriptSnapshot: (prev) => {
+            const next = this.lastCallTranscriptSnapshot;
+            return next.length > 0 ? next : prev;
+          },
         });
       }
     }

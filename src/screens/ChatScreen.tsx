@@ -74,7 +74,7 @@ import {
   type RevealSchedule,
 } from '../features/chat/message-segments';
 import type { LiveSettingsConfig, LiveTranscriptItem, LiveCallOrigin } from '../core/domain/live-types';
-import { DEFAULT_LIVE_SETTINGS } from '../core/domain/live-types';
+import { DEFAULT_LIVE_SETTINGS, SMARTROTATOR_LIVE_RELAY_BASE_URL } from '../core/domain/live-types';
 import LivePermissionModal from '../components/live/LivePermissionModal';
 import LiveCompanionOverlay, { getActiveLiveClient, disposeActiveLiveCall } from '../components/live/LiveCompanionOverlay';
 import { isLiveCallActive } from '../features/ai/live-call-state';
@@ -644,7 +644,10 @@ export default function ChatScreen({
     const provider = container.providerSettings.getProviderById(provId)
       ?? container.providerSettings.getActiveProvider()
       ?? container.providerSettings.getHiddenDefaultFull();
-    return provider?.baseUrl ? normalizeServerRoot(provider.baseUrl) : undefined;
+    // SmartRotator gateway → dedicated LIVE relay (workers.dev), not the
+    // login/API server root. Non-live traffic (auth, LLM, web search) keeps
+    // its own roots — sirf live wala change.
+    return provider?.baseUrl ? SMARTROTATOR_LIVE_RELAY_BASE_URL : undefined;
   };
 
   const handleStartLiveCall = async (meta?: { reason?: string; isIncomingCall?: boolean; origin?: LiveCallOrigin }) => {
@@ -2280,6 +2283,7 @@ export default function ChatScreen({
           config={{
             ...liveConfig,
             baseUrl: getLiveBaseUrl(),
+            sessionId: liveCallSessionIdRef.current ?? active?.id ?? undefined,
             enable90DayTrack: container.store.get().enable90DayTrack !== false,
             timeZone: container.store.get().timeZone ?? deviceTimeZone(),
           }}

@@ -14,6 +14,13 @@ export interface LiveCallRecord {
   endedAt: number;
   /** call duration in seconds. */
   durationSec: number;
+  /**
+   * Chat session the call happened in. Lets chat deletion purge exactly that
+   * session's calls — otherwise Misa keeps saying "Total N live calls hui hain"
+   * after the chat (and its calls) were deleted. Undefined = legacy record
+   * (pre-session-keying); those are never purged by session deletion.
+   */
+  sessionId?: string;
 }
 
 export interface PersistedLiveCallHistory {
@@ -23,6 +30,13 @@ export interface PersistedLiveCallHistory {
   recent: LiveCallRecord[];
   /** Message ids from the most recent call, reused as continuation context. */
   lastTranscriptSnapshot: string[];
+  /**
+   * endedAt of the call that produced `lastTranscriptSnapshot`. Lets
+   * purgeLiveCallsForSession decide whether the tail belonged to a deleted
+   * chat's call. Undefined = snapshot was set externally (redial seeding) and
+   * is treated as untracked.
+   */
+  lastTranscriptSnapshotAt?: number;
 }
 
 const STORAGE_KEY = 'levelup.live.call_history';
@@ -68,6 +82,9 @@ export function loadLiveCallHistory(): PersistedLiveCallHistory {
       lastTranscriptSnapshot: Array.isArray(parsed.lastTranscriptSnapshot)
         ? parsed.lastTranscriptSnapshot.slice(0, 20)
         : [],
+      lastTranscriptSnapshotAt: Number.isFinite(parsed.lastTranscriptSnapshotAt)
+        ? parsed.lastTranscriptSnapshotAt
+        : undefined,
     };
   } catch {
     return empty();
@@ -86,28 +103,66 @@ function persist(history: PersistedLiveCallHistory): void {
 
 /**
  * Record a completed live call. `updateTranscriptSnapshot` can be omitted; pass
- * it to seed the next redial with continuation context.
+ * it to seed the next redial with continuation context. `sessionId` ties the
+ * call to its chat session so deleting that chat can purge its calls.
  */
 export function recordLiveCall(
   endedAt: number,
   durationSec: number,
-  updateTranscriptSnapshot?: (prev: string[]) => string[],
+  opts?: { sessionId?: string; updateTranscriptSnapshot?: (prev: string[]) => string[] },
 ): PersistedLiveCallHistory {
   const history = loadLiveCallHistory();
   history.totalCalls += 1;
-  history.recent.unshift({ endedAt, durationSec });
+  history.recent.unshift({ endedAt, durationSec, sessionId: opts?.sessionId || undefined });
   if (history.recent.length > MAX_CALL_LOG) history.recent.length = MAX_CALL_LOG;
-  if (typeof updateTranscriptSnapshot === 'function') {
-    history.lastTranscriptSnapshot = updateTranscriptSnapshot(history.lastTranscriptSnapshot).slice(0, 20);
+  if (typeof opts?.updateTranscriptSnapshot === 'function') {
+    history.lastTranscriptSnapshot = opts.updateTranscriptSnapshot(history.lastTranscriptSnapshot).slice(0, 20);
+    history.lastTranscriptSnapshotAt = endedAt;
   }
   persist(history);
   return history;
+}
+
+/**
+ * Delete every persisted call that belongs to `sessionId` and decrement the
+ * total-call counter accordingly (bounded by the records still in the log).
+ * The transcript snapshot is cleared when it was produced by one of the
+ * deleted calls — so Misa cannot quote a deleted chat's last words. Legacy
+ * records (no sessionId) are never touched. Returns how many records were
+ * removed; 0 for unknown / untagged / empty histories.
+ */
+export function purgeLiveCallsForSession(sessionId: string): number {
+  if (!sessionId) return 0;
+  const history = loadLiveCallHistory();
+  const removedAts = new Set<number>();
+  const kept: LiveCallRecord[] = [];
+  for (const r of history.recent) {
+    if (r.sessionId === sessionId) {
+      removedAts.add(r.endedAt);
+    } else {
+      kept.push(r);
+    }
+  }
+  const removed = history.recent.length - kept.length;
+  if (removed === 0) return 0;
+  history.recent = kept;
+  history.totalCalls = Math.max(0, history.totalCalls - removed);
+  if (history.lastTranscriptSnapshotAt !== undefined && removedAts.has(history.lastTranscriptSnapshotAt)) {
+    history.lastTranscriptSnapshot = [];
+    history.lastTranscriptSnapshotAt = undefined;
+  }
+  persist(history);
+  return removed;
 }
 
 /** Merge an in-memory snapshot into the persisted history (used at connect). */
 export function setLastTranscriptSnapshot(snapshot: string[]): void {
   const history = loadLiveCallHistory();
   history.lastTranscriptSnapshot = snapshot.slice(0, 20);
+  // Snapshot seeded externally (redial/connect context) has no record origin —
+  // purgeLiveCallsForSession treats it as untracked so it survives chat
+  // deletion (only snapshots produced by a deleted call are forgotten).
+  history.lastTranscriptSnapshotAt = undefined;
   persist(history);
 }
 
