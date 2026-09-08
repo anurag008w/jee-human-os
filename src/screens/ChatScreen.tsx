@@ -1796,9 +1796,14 @@ export default function ChatScreen({
 
   useEffect(() => {
     const unsubscribe = proactiveAgentService.onMessageInjection((injected) => {
-      if (!active) return;
+      // REAL-FIX (notification-tap race): active session abhi load nahi hua
+      // (boot/background-resume) → ye listener kuch deliver NAHI kar saka.
+      // Service ko `false` return karke batana zaroori hai taaki wo store
+      // fallback chala sake. Pehle silent `return` → service ne "delivered"
+      // maan liya → message poori tarah gayab ho jaata tha.
+      if (!active) return false;
       const msg: ChatMessage = {
-        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        id: injected.msgId ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         role: injected.role,
         content: injected.text,
         createdAt: new Date().toISOString(),
@@ -1809,6 +1814,7 @@ export default function ChatScreen({
       container.chat.appendMessage(active.id, msg);
       refresh();
       haptic();
+      return true;
     });
     return unsubscribe;
   }, [active, refresh]);
@@ -1819,10 +1825,10 @@ export default function ChatScreen({
   // listener ke bina dispatch hua tha.
   useEffect(() => {
     const onProactiveWindow = (e: Event) => {
-      const detail = (e as CustomEvent<{ text: string; isProactive?: boolean }>).detail;
+      const detail = (e as CustomEvent<{ text: string; isProactive?: boolean; msgId?: string }>).detail;
       if (!detail?.text || !active) return;
       const msg: ChatMessage = {
-        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        id: detail.msgId ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         role: 'assistant',
         content: detail.text,
         createdAt: new Date().toISOString(),

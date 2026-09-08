@@ -64,6 +64,8 @@ export interface ProactiveTrigger {
   offlineMessage: string;
   callReason?: string;
   requiresOnline?: boolean;
+  /** DND-deferred delivery kitni baar retry ho chuki (cap lagata hai). */
+  deliveryRetries?: number;
 }
 
 /** AI tools (scheduleMessage/makeCall) se banaya gaya scheduled item. */
@@ -113,13 +115,25 @@ export interface IncomingCallEvent {
 }
 
 export type IncomingCallListener = (event: IncomingCallEvent) => void;
-export type MessageInjectionListener = (message: {
+
+export interface MessageInjectionPayload {
   role: 'assistant';
   text: string;
   isProactive?: boolean;
   isCallEvent?: boolean;
   callStatus?: CallStatusType;
-}) => void;
+  /** Service ek hi id banata hai — UI listener + store fallback dono yahi use
+   *  karte hain taaki appendMessage by-id idempotency se kabhi duplicate na
+   *  bane (notification-tap race fix ka core). */
+  msgId?: string;
+}
+
+/**
+ * Listener contract: `false` return karo agar message DELIVER nahi hua (e.g.
+ * active session abhi load nahi hua). Service tab store fallback chala ke
+ * at-least-once persistence guarantee karta hai. `undefined`/`true` = delivered.
+ */
+export type MessageInjectionListener = (message: MessageInjectionPayload) => void | boolean;
 
 const DYNAMIC_TEMPLATES: Record<string, string[]> = {
   inactivity_daytime: [
@@ -294,6 +308,8 @@ class ProactiveAgentService {
   /** Same-text injection dedupe — ek hi message 3 baar na aaye. */
   private recentInjected: Map<string, number> = new Map();
   private static readonly INJECT_DEDUPE_WINDOW_MS = 3 * 60 * 1000;
+  /** Soft/DND-blocked due trigger kitni baar re-schedule ho sakta hai (5-min × cap). */
+  private static readonly MAX_DELIVERY_RETRIES = 3;
 
   /** Memory-based spontaneous messaging — kab tak dobara mat bhejo. */
   private nextSpontaneousAt = 0;
@@ -586,6 +602,27 @@ class ProactiveAgentService {
         continue;
       }
 
+      // REAL-FIX (proactive delivery promise): a due nudge's native notification
+      // ALREADY fired at scheduledTime (LocalNotifications.schedule in the
+      // background) — chat injection is the COMPLETION of that promise, never a
+      // fresh proactive initiation. The soft guards (30-min active-grace,
+      // fatigue, exact-duplicate, completed-task) must therefore NOT drop it.
+      //
+      // Purana behaviour: trigger ko pendingTriggers se pehle hi remove karke
+      // validate kiya jaata tha; validation block (grace = user abhi app khol
+      // kar aaya) → `if (validation.valid)` fail → message SILENTLY lost →
+      // "notification aaya, chat me message hai hi nahi". Sirf explicit DND
+      // shield ab bhi defer karta hai — bounded retry ke saath, kabhi silent
+      // drop nahi.
+      if (now < relState.boundaries.dndUntilTimestamp) {
+        const tries = (trig.deliveryRetries ?? 0) + 1;
+        if (tries < ProactiveAgentService.MAX_DELIVERY_RETRIES) {
+          this.pendingTriggers.push({ ...trig, scheduledTime: now + 5 * 60 * 1000, deliveryRetries: tries });
+          this.saveState();
+        }
+        continue;
+      }
+
       const validation = validateProactiveDelivery(
         {
           id: `trig_${trig.id}`,
@@ -607,11 +644,9 @@ class ProactiveAgentService {
         }
       );
 
-      if (validation.valid) {
-        const msg = validation.sanitizedText || trig.offlineMessage;
-        this.injectMessageIntoChat(msg);
-        relationshipManager.recordProactiveSent(trig.topic || "proactive_nudge", msg);
-      }
+      const msg = validation.sanitizedText || trig.offlineMessage;
+      this.injectMessageIntoChat(msg);
+      relationshipManager.recordProactiveSent(trig.topic || "proactive_nudge", msg);
     }
   }
 
@@ -1903,22 +1938,43 @@ Instructions:
       }
     }
 
-    // Direct listener path (ChatScreen mounted + visible)
+    // REAL-FIX (notification-tap race): EK hi msgId har delivery path
+    // (listener, store fallback, window event) use karta hai. Toh ChaScreen
+    // bhi append kare aur service bhi, appendMessage by-id idempotent hai →
+    // message kabhi duplicate nahi, aur kabhi-sometimes gayab bhi nahi.
+    const msgId = `msg-${now}-${Math.random().toString(36).slice(2, 6)}`;
+    const payload: MessageInjectionPayload = {
+      role: 'assistant',
+      text,
+      isProactive: true,
+      msgId,
+    };
+
+    // Direct listener path (ChatScreen mounted + ready). Listener `false`
+    // return karke bata sakta hai ki usne deliver NAHI kiya (e.g. active
+    // session abhi load nahi hua). Purana code pehle `delivered = true` sirf
+    // isliye karta tha ki listener ne THROW nahi kiya — jabki ChatScreen
+    // silently `return` kar sakta tha → store fallback + window event dono
+    // skip → notification tap ke baad message poori tarah gayab. Ab sirf
+    // "listener ne confirm kiya" hi delivered hai.
     let delivered = false;
     for (const listener of this.messageInjectionListeners) {
       try {
-        listener({ role: 'assistant', text, isProactive: true });
-        delivered = true;
+        if (listener(payload) !== false) delivered = true;
       } catch {}
     }
 
-    // Persist to store if ChatScreen listener wasn't active
+    // Persist-to-store at-least-once safety net — SAME msgId → appendMessage
+    // ki by-id idempotency se kabhi duplicate nahi banta. ChatScreen ready na
+    // hone par (boot/tap race) message yahan session me commit ho jaata hai,
+    // app kholne par history me milta hai. Notification aaya + chat me hi
+    // nahi — isi race ka fix.
     if (!delivered) {
       try {
         const activeId = container?.chat?.getActiveSessionId?.() || container?.chat?.listSessions?.()?.[0]?.id;
         if (activeId) {
           container.chat.appendMessage(activeId, {
-            id: `msg-${now}-${Math.random().toString(36).slice(2, 6)}`,
+            id: msgId,
             role: 'assistant',
             content: text,
             createdAt: new Date(now).toISOString(),
@@ -1928,11 +1984,12 @@ Instructions:
       } catch {}
     }
 
-    // Window event fallback for active views
+    // Window event fallback for active views — SAME msgId hota hai, isliye
+    // yahan bhi koi duplicate nahi aayega.
     if (!delivered && typeof window !== 'undefined') {
       window.dispatchEvent(
         new CustomEvent('levelup:proactive-message', {
-          detail: { text, isProactive: true },
+          detail: { text, isProactive: true, msgId },
         })
       );
     }

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { proactiveAgentService } from '../proactive-agent.service';
 import { relationshipManager } from '../relationship-state';
 import { setLiveCallActive } from '../live-call-state';
+import { container } from '../../../di/container';
 
 const mockStorage: Record<string, string> = {};
 global.localStorage = {
@@ -231,6 +232,100 @@ describe('ProactiveAgentService Production Hardening', () => {
     vi.useRealTimers();
     expect(calls).toBe(1);
 
+    unsub();
+  });
+
+  it('14. REAL-FIX: due nudge whose notification ALREADY fired is NEVER dropped by the 30-min grace gate', () => {
+    const injected: any[] = [];
+    const unsub = proactiveAgentService.onMessageInjection((msg) => {
+      injected.push(msg);
+    });
+    proactiveAgentService.updatePreferences({
+      quietHoursStart: '00:00',
+      quietHoursEnd: '00:00',
+    });
+
+    // User abhi app khol kar aaya (active 0 min ago, chat me nahi) → grace
+    // shield OLD code me validation ko block karke message consume-and-drop
+    // kar deta tha jabki native notification pehle hi fire ho chuki thi.
+    proactiveAgentService.recordUserActivity();
+    proactiveAgentService.setInChatSession(false);
+
+    // Background me scheduled nudge jo abhi due ho gaya (notification fired).
+    (proactiveAgentService as any).pendingTriggers = [
+      {
+        id: 777001,
+        type: 'chat_nudge',
+        scheduledTime: Date.now() - 5000,
+        topic: 'optics',
+        offlineMessage: 'Optics ka wala nudge jo notification me aaya tha',
+      },
+    ];
+
+    (proactiveAgentService as any).checkAndDispatchDueTriggers();
+
+    // Delivery promise: message chat me poora milna chahiye — NOT silently lost.
+    expect(injected.length).toBe(1);
+    expect(injected[0].text).toBe('Optics ka wala nudge jo notification me aaya tha');
+    expect((proactiveAgentService as any).pendingTriggers.length).toBe(0);
+    unsub();
+  });
+
+  it('15. REAL-FIX: listener not-ready (return false) still persists the message to chat store with SAME msgId', () => {
+    proactiveAgentService.updatePreferences({
+      quietHoursStart: '00:00',
+      quietHoursEnd: '00:00',
+    });
+    const session = container.chat.createSession('Misa boot race');
+    container.chat.setActiveSessionId(session.id);
+
+    // ChatScreen mount-ho-rahahai: listener EXITS, `active` abhi load nahi hua.
+    const received: any[] = [];
+    const unsub = proactiveAgentService.onMessageInjection((msg) => {
+      received.push(msg);
+      return false; // mera active session ready nahi — deliver nahi kar saka
+    });
+
+    proactiveAgentService.injectMessageIntoChat('Notification tap race wala message');
+
+    // At-least-once: message chat history me commit ho jaana chahiye.
+    const stored = container.chat.getSession(session.id)!.messages;
+    expect(stored.length).toBe(1);
+    expect(stored[0].content).toBe('Notification tap race wala message');
+    expect(stored[0].isProactive).toBe(true);
+    // SAME msgId listener ko bhi mila → UI baad me ready ho toh bhi duplicate na bane.
+    expect(received[0].msgId).toBe(stored[0].id);
+    unsub();
+  });
+
+  it('16. listener delivers (true) → service does NOT double-persist (delivered guard)', () => {
+    proactiveAgentService.updatePreferences({
+      quietHoursStart: '00:00',
+      quietHoursEnd: '00:00',
+    });
+    const session = container.chat.createSession('Misa delivered');
+    container.chat.setActiveSessionId(session.id);
+
+    let count = 0;
+    const unsub = proactiveAgentService.onMessageInjection((msg) => {
+      count += 1;
+      // UI path ne append kar liya (same msgId se) — service ka store fallback skip.
+      container.chat.appendMessage(session.id, {
+        id: msg.msgId!,
+        role: msg.role,
+        content: msg.text,
+        createdAt: new Date().toISOString(),
+        isProactive: msg.isProactive,
+      });
+      return true;
+    });
+
+    proactiveAgentService.injectMessageIntoChat('Delivered through UI only');
+
+    expect(count).toBe(1);
+    const stored = container.chat.getSession(session.id)!.messages;
+    expect(stored.length).toBe(1);
+    expect(stored[0].content).toBe('Delivered through UI only');
     unsub();
   });
 });
