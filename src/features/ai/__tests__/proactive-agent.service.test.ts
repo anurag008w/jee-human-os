@@ -170,6 +170,13 @@ describe('ProactiveAgentService Production Hardening', () => {
   });
 
   it('11. permanently-blocked scheduled message is dropped after retry cap, not lost silently or retried forever', () => {
+    // Clock-independent: neutral quiet-hours window (00:00-00:00) lagao taaki
+    // CI/locally 03:00-06:00 UTC ke andar chale toh checkScheduledMessages
+    // early-return na kare (quiet-time guard) aur retry-cap loop hamesha chale.
+    proactiveAgentService.updatePreferences({
+      quietHoursStart: '00:00',
+      quietHoursEnd: '00:00',
+    });
     const now = Date.now();
     // First attempt blocked → retry scheduled (cap 3 total tries).
     proactiveAgentService.scheduleMessage('Optics wala reminder', now - 5000, 'optics');
