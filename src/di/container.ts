@@ -114,8 +114,11 @@ export function createContainer(
           innerStore.reload();
           // AUDIT FIX (round 1): multi-tab chat writes were never re-read (only
           // the state store was); a chat typed in another tab stayed invisible.
-          // Same N2 pattern as the state store. reloadFromStorage flushes again
-          // internally — harmless, keeps its own invariant self-contained.
+          // Same N2 pattern as the state store. reloadFromStorage flushes any
+          // pending debounced write internally (round 2), then reloads — but it
+          // only flushes when a write is actually pending (round 3), so a blind
+          // stale-cache write can never clobber fresher data just persisted by
+          // a background reply or sync restore.
           chat.reloadFromStorage();
         });
       }

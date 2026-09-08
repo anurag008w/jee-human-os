@@ -259,12 +259,19 @@ export class ChatService {
    * (cache overwritten from disk) and the still-armed persistTimer would then
    * GRATUITOUSLY WRITE THE STALE RELOADED STATE back over disk — clobbering the
    * very data another tab/sync just delivered. Mirrors CachedStateStore.reload().
+   *
+   * AUDIT FIX (round 3, SEVERE): only flush when a debounced write is actually
+   * PENDING. The container already flushes before calling this, so a blind
+   * flush here would write the CURRENT (possibly stale) cache over fresher disk
+   * data that a background reply or sync restore just persisted — e.g. an
+   * assistant reply completed in the background was persisted, then app
+   * visible → reload flushes the stale pre-reply cache over it → reply gone.
+   * persistTimer !== null is exactly "cache has unsaved writes"; otherwise the
+   * reload is a pure read.
    */
   reloadFromStorage(): void {
-    this.flush();
     if (this.persistTimer !== null) {
-      clearTimeout(this.persistTimer);
-      this.persistTimer = null;
+      this.flush();
     }
     this.cache = this.repo.load();
   }
@@ -485,7 +492,7 @@ export class ChatService {
     attachments?: ChatAttachment[],
     onlyTools?: string[],
   ): Promise<ChatMessage> {
-    const session = this.getSession(sessionId);
+    let session = this.getSession(sessionId);
     if (!session) throw new Error('Chat session not found');
 
     // When a fresh chat was just created, prior conversations are being
@@ -496,6 +503,12 @@ export class ChatService {
     if (this.pendingSummary) {
       await this.pendingSummary;
     }
+
+    // AUDIT FIX (round 3, SEVERE): `reloadFromStorage()` on app-visible can
+    // replace the cache while the summary await was running. Re-resolve so the
+    // user-message push below lands in the LIVE graph — otherwise it writes to
+    // a detached snapshot and persist() (which saves this.state()) drops it.
+    session = this.getSession(sessionId) ?? session;
 
     const now = this.clock.now().toISOString();
     const userMsg: ChatMessage = { id: uid(), role: 'user', content: text, createdAt: now, attachments };
@@ -935,13 +948,18 @@ export class ChatService {
           this.appendAssistant(session, assistant);
           return assistant;
         }
-        session.messages.pop();
-        if (titleWasEmpty) session.title = '';
+        // AUDIT FIX (round 3): re-resolve live — a reload may have detached the
+        // captured session; popping the detached copy would leave the user
+        // message in the LIVE cache and a retry would duplicate it.
+        const abortRollback = this.getSession(session.id) ?? session;
+        abortRollback.messages.pop();
+        if (titleWasEmpty) abortRollback.title = '';
         this.persist();
         throw err;
       }
-      session.messages.pop();
-      if (titleWasEmpty) session.title = '';
+      const rollback = this.getSession(session.id) ?? session;
+      rollback.messages.pop();
+      if (titleWasEmpty) rollback.title = '';
       this.persist();
       throw err;
     }
@@ -1716,10 +1734,20 @@ export class ChatService {
     const content = stripSilenceToken(assistant.content ?? '');
     if (isPureSilenceToken(content)) return; // nothing meaningful — drop the turn
     const msg: ChatMessage = { ...assistant, content };
-    session.messages.push(msg);
-    const overflow = session.messages.length - MAX_MESSAGES_PER_SESSION;
-    if (overflow > 0) session.messages.splice(0, overflow);
-    session.updatedAt = this.clock.now().toISOString();
+    // AUDIT FIX (round 3, SEVERE [background reply lost]): `reloadFromStorage()`
+    // REPLACES the whole in-memory cache graph when the app resumes (visible).
+    // A send() that captured its `session` reference before that swap now holds
+    // a DETACHED snapshot — appending there + flush() would persist the NEW
+    // cache (which never got the reply), so the assistant turn vanished from
+    // chat while its notification still fired. Re-resolve the LIVE session by
+    // id so the reply always lands in the current graph. If the session was
+    // deleted mid-flight, drop the turn (matches delete-intent).
+    const live = this.getSession(session.id);
+    if (!live) return;
+    live.messages.push(msg);
+    const overflow = live.messages.length - MAX_MESSAGES_PER_SESSION;
+    if (overflow > 0) live.messages.splice(0, overflow);
+    live.updatedAt = this.clock.now().toISOString();
     // Hang-fix P2: a completed assistant turn is a natural commit point — write
     // the final reply to disk IMMEDIATELY (coalescing the turn's debounced
     // interim writes) so it survives an imminent page hide / process death.

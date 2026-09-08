@@ -104,6 +104,30 @@ function makeStreamingProvider(id: ProviderId, replies: string[], errors: unknow
   };
 }
 
+/** Provider whose stream does not resolve until `release()` is called. */
+function makeGatedProvider(replies: string[]): { provider: LLMProvider; release: () => void } {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  let calls = 0;
+  const provider: LLMProvider = {
+    id: 'openrouter',
+    label: 'OpenRouter',
+    isConfigured: () => true,
+    complete: async (): Promise<LLMResponse> => ({ text: '', model: 'openrouter' }),
+    stream: async (): Promise<LLMResponse> => {
+      const idx = calls;
+      calls += 1;
+      await gate;
+      return { text: replies[idx] ?? '', model: 'openrouter' };
+    },
+    fetchModels: async (): Promise<ModelInfo[]> => [],
+    healthCheck: async (): Promise<HealthCheckResult> => ({ ok: true, provider: 'openrouter', latencyMs: 1 }),
+  };
+  return { provider, release };
+}
+
 function buildService(deps: {
   replies?: string[];
   errors?: unknown[];
@@ -111,6 +135,7 @@ function buildService(deps: {
   aiSettings?: Partial<AppState['aiSettings']>;
   repo?: ChatRepository;
   withMemory?: boolean;
+  provider?: LLMProvider;
 }): { chat: ChatService; repo: ChatRepository; store: StateStore } {
   const repo = deps.repo ?? new MemoryChatRepository();
   const store = makeStore(
@@ -119,7 +144,7 @@ function buildService(deps: {
       aiEnabled: true,
     },
   );
-  const provider = makeStreamingProvider('openrouter', deps.replies ?? ['hi there'], deps.errors ?? []);
+  const provider = deps.provider ?? makeStreamingProvider('openrouter', deps.replies ?? ['hi there'], deps.errors ?? []);
   const factory: ProviderFactory = {
     create: () => provider,
   } as unknown as ProviderFactory;
@@ -336,6 +361,88 @@ describe('ChatService', () => {
     const stored = repo.load().sessions[0];
     expect(stored.title).toBe('hello');
     expect(stored.messages.map((m) => m.content)).toEqual(['hello', 'reply']);
+  });
+
+  it('keeps the assistant reply when reloadFromStorage runs mid-stream (background reply regression)', async () => {
+    // Regression: user sends a message, app goes background, AI is still
+    // streaming. User opens the app (notification tap / resume) →
+    // reloadFromStorage() replaces the in-memory cache with a fresh graph from
+    // disk while the in-flight send still holds the OLD session reference.
+    // appendAssistant must land the finished reply in the LIVE graph — writing
+    // to the detached snapshot would silently lose it from chat (while the
+    // notification still fires).
+    const { provider, release } = makeGatedProvider(['background reply']);
+    const repo = new FreshLoadChatRepository();
+    const { chat } = buildService({ repo, provider });
+    const session = chat.createSession();
+
+    // send() is awaited by the UI; here we keep the promise in flight until
+    // the stream is released, simulating the background reply window.
+    const sendPromise = chat.send(session.id, 'hello');
+
+    // App resumes while the stream is still pending → cache is replaced.
+    chat.reloadFromStorage();
+
+    // Stream completes AFTER the reload — reply must survive in live graph.
+    release();
+    const reply = await sendPromise;
+    expect(reply.content).toBe('background reply');
+    expect(chat.getSession(session.id)!.messages.map((m) => m.content)).toEqual(['hello', 'background reply']);
+    const stored = repo.load().sessions[0];
+    expect(stored.messages.map((m) => m.content)).toEqual(['hello', 'background reply']);
+  });
+
+  it('keeps a background-persisted reply that predates reloadFromStorage (no stale flush clobber)', async () => {
+    // Regression: the reply COMPLETED in the background and appendAssistant
+    // already flushed it to disk. On resume, reloadFromStorage() must NOT flush
+    // the stale in-memory cache back over the newer disk data (round-2
+    // blind flush) — otherwise the reply vanishes.
+    const repo = new FreshLoadChatRepository();
+    const { chat } = buildService({ repo, replies: ['bg reply'] });
+    const session = chat.createSession();
+
+    // Simulate: background send already persisted the reply to the repo
+    // (FreshLoadChatRepository.save serializes it), while the in-memory cache
+    // is now older than disk.
+    repo.save({
+      version: 1,
+      sessions: [
+        {
+          ...session,
+          messages: [
+            { id: 'u1', role: 'user', content: 'hello', createdAt: new Date().toISOString() },
+            { id: 'a1', role: 'assistant', content: 'bg reply', createdAt: new Date().toISOString() },
+          ],
+        },
+      ],
+    });
+
+    // Resume → reload. Must NOT write stale cache (empty session) over repo.
+    chat.reloadFromStorage();
+
+    const loaded = repo.load().sessions[0];
+    expect(loaded.messages.map((m) => m.content)).toEqual(['hello', 'bg reply']);
+    expect(chat.getSession(session.id)!.messages.map((m) => m.content)).toEqual(['hello', 'bg reply']);
+  });
+
+  it('lands a send that finishes after reloadFromStorage with a pending debounced write (flush-then-reload)', async () => {
+    // Round-2 invariant must survive: a debounced write still inside the 500ms
+    // window when reload happens is flushed FIRST so it is not lost, and the
+    // in-flight completion afterwards still lands in the reloaded graph.
+    const { provider, release } = makeGatedProvider(['later reply']);
+    const repo = new FreshLoadChatRepository();
+    const { chat } = buildService({ repo, provider });
+    const session = chat.createSession();
+    const sendPromise = chat.send(session.id, 'hello'); // user msg appended + debounce armed
+
+    // Immediately reload (no artificial flush) — pending write must survive.
+    chat.reloadFromStorage();
+    release();
+    const reply = await sendPromise;
+    expect(reply.content).toBe('later reply');
+    expect(chat.getSession(session.id)!.messages.map((m) => m.content)).toEqual(['hello', 'later reply']);
+    const stored = repo.load().sessions[0];
+    expect(stored.messages.map((m) => m.content)).toEqual(['hello', 'later reply']);
   });
 
   it('appendMessages persists the whole flush ONCE (live-call transcript sink)', () => {
