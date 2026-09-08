@@ -71,6 +71,35 @@ export function getActiveLiveClient(): GeminiLiveClient | null {
   return activeLiveClient;
 }
 
+/**
+ * LIVE-CONTINUITY FIX: end ANY live call still registered in the module-level
+ * singleton (a call the user left running in background/PiP — the app keeps it
+ * alive WhatsApp-style — or a stale client left after an app kill), so a NEW
+ * user-intent call (Live button tap / incoming-call accept) always starts FRESH
+ * with the CURRENT chat's context instead of resuming the previous call's Gemini
+ * Live conversation ("call me chat ka content nahi aa raha" bug).
+ *
+ * Idempotent: no-op when no client is registered. Mirrors handleEndCall's
+ * teardown minus the onClose transcript handoff — no overlay is mounted when
+ * ChatScreen calls this before opening a fresh call.
+ */
+export function disposeActiveLiveCall(): void {
+  const client = activeLiveClient;
+  if (!client) return;
+  // Clear the module singleton + routing flag in the SAME tick (same rule as
+  // handleEndCall) so no send() can hit a "call active + client missing" window.
+  activeLiveClient = null;
+  setLiveCallActive(false);
+  try {
+    // Explicit hangup: full teardown, reconnect timers killed, no resurrection.
+    client.disconnect(false);
+  } catch {
+    // Best-effort — the client is being abandoned for a fresh call anyway.
+  }
+  void stopLiveCompanionService();
+  void resetNativeAudioRoute().catch(() => undefined);
+}
+
 // Ever-increasing overlay generation. Every overlay mount captures `++overlayEpoch`
 // as its own epoch. Global native teardown calls (stopLiveCompanionService,
 // clearLiveCallInterrupted) are SHARED — a stale/cancelled mount must never tear
@@ -444,12 +473,16 @@ export default function LiveCompanionOverlay({
     const existingClient = activeLiveClient;
     const liveClient = existingClient || new GeminiLiveClient(config, callbacks);
     liveClient.setCallbacks(callbacks);
-    if (!existingClient) {
-      liveClient.setPrompts(systemPrompt, memoryContext, userPersona);
-      // ChatScreen already caps initialMessages at 25 (conversationHistoryLength);
-      // tell the client to keep that cap instead of its default 15.
-      liveClient.setRecentChatHistory(initialMessages, 25);
-    }
+    // LIVE-CONTINUITY FIX: re-seed prompts + recent-chat history on EVERY mount
+    // (fresh OR reattach). The old `if (!existingClient)` gate left a reused
+    // singleton client with STALE seeded context — the next reconnect would then
+    // build its system prompt from the PREVIOUS call's messages instead of the
+    // current chat's tail. Seeding is idempotent; on a genuinely fresh client it
+    // is identical to before.
+    liveClient.setPrompts(systemPrompt, memoryContext, userPersona);
+    // ChatScreen already caps initialMessages at 25 (conversationHistoryLength);
+    // tell the client to keep that cap instead of its default 15.
+    liveClient.setRecentChatHistory(initialMessages, 25);
     clientRef.current = liveClient;
     let cancelled = false;
     // This mount's generation: only the newest overlay may run the SHARED native

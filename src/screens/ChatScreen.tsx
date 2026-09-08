@@ -76,8 +76,9 @@ import {
 import type { LiveSettingsConfig, LiveTranscriptItem, LiveCallOrigin } from '../core/domain/live-types';
 import { DEFAULT_LIVE_SETTINGS } from '../core/domain/live-types';
 import LivePermissionModal from '../components/live/LivePermissionModal';
-import LiveCompanionOverlay, { getActiveLiveClient } from '../components/live/LiveCompanionOverlay';
+import LiveCompanionOverlay, { getActiveLiveClient, disposeActiveLiveCall } from '../components/live/LiveCompanionOverlay';
 import { isLiveCallActive } from '../features/ai/live-call-state';
+import { buildLiveCallOverview } from '../core/domain/live-call-history';
 import { requestNativeCallAudioFocus, setNativeAudioRoute, resetNativeAudioRoute, isNativeAudioPlatform } from '../lib/native-audio-route';
 import { isLiveCallInterrupted, clearLiveCallInterrupted } from '../lib/live-companion-service';
 import { normalizeServerRoot } from '../lib/auth';
@@ -648,6 +649,14 @@ export default function ChatScreen({
 
   const handleStartLiveCall = async (meta?: { reason?: string; isIncomingCall?: boolean; origin?: LiveCallOrigin }) => {
     haptic();
+    // LIVE-CONTINUITY FIX (call me chat ka content nahi aa raha): a NEW
+    // user-intent call must NEVER inherit the previous call's context. If a live
+    // client survived (background/PiP continuation — the app keeps the call alive
+    // WhatsApp-style — or a stale client after an app kill), hang it up FIRST so
+    // the fresh overlay mounts a client seeded with the CURRENT chat's messages.
+    // This is the ONLY mount path (Live button tap + incoming-call accept), so a
+    // genuinely ongoing PiP call is never affected — it never re-runs here.
+    disposeActiveLiveCall();
     setLiveIncomingMeta(meta && meta.isIncomingCall ? { isIncomingCall: true, reason: meta.reason, origin: meta.origin } : undefined);
     const key = getGeminiLiveApiKey();
     if (!key) {
@@ -2249,6 +2258,9 @@ export default function ChatScreen({
                 : '',
               container.chat.getJourneyContext()
                 ? `[LIVE JOURNEY CONTEXT]:\n${container.chat.getJourneyContext()}`
+                : '',
+              buildLiveCallOverview()
+                ? `[LIVE CALL HISTORY]:\n${buildLiveCallOverview()}`
                 : '',
             ]
               .filter(Boolean)

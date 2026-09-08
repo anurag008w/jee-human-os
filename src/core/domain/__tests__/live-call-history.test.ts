@@ -13,6 +13,7 @@ import {
   setLastTranscriptSnapshot,
   loadLastTranscriptSnapshot,
   describeLastCall,
+  buildLiveCallOverview,
   MAX_CALL_LOG,
   setLiveCallHistoryStorage,
 } from '../live-call-history';
@@ -115,5 +116,35 @@ describe('describeLastCall', () => {
     const r = describeLastCall(now);
     expect(r?.text).toContain('din pehle');
     expect(r?.diffMs).toBe(3 * 86_400_000);
+  });
+});
+
+describe('buildLiveCallOverview (AI context injection)', () => {
+  const now = 10_000_000_000;
+
+  it('returns empty string when no call has ever completed', () => {
+    expect(buildLiveCallOverview(now)).toBe('');
+  });
+
+  it('reports total calls + last-call timing and duration', () => {
+    recordLiveCall(now - 2 * 86_400_000, 300); // oldest first — recent[] is unshifted
+    recordLiveCall(now - 5 * 60_000, 182);
+    const out = buildLiveCallOverview(now);
+    expect(out).toContain('Total 2 live calls');
+    expect(out).toContain('~5 min pehle');
+    expect(out).toContain('~182s');
+  });
+
+  it('keeps the last-call transcript tail so Misa can answer "last call me kya hui thi"', () => {
+    setLastTranscriptSnapshot(['Student: integration samjha do', 'Misa: u aur v sath khelte hai']);
+    recordLiveCall(now - 60_000, 90);
+    const out = buildLiveCallOverview(now);
+    expect(out).toContain('Pichli call me kya discuss hua tha');
+    expect(out).toContain('u aur v');
+  });
+
+  it('tolerates corrupt storage (empty overview, no crash)', () => {
+    storage.setItem('levelup.live.call_history', '{not valid json');
+    expect(buildLiveCallOverview(now)).toBe('');
   });
 });

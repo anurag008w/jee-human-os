@@ -126,3 +126,33 @@ export function describeLastCall(now = Date.now()): { text: string; diffMs: numb
   if (diffMs < 86_400_000) return { text: `~${Math.max(1, Math.round(diffMs / 3_600_000))} ghante pehle`, diffMs };
   return { text: `~${Math.max(1, Math.round(diffMs / 86_400_000))} din pehle`, diffMs };
 }
+
+/**
+ * Compact, human-readable LIVE-CALL overview for AI context injection (TEXT chat
+ * replies AND live-call system prompts). Gives Misa the same "kitni baar call
+ * kiya, kab call hua, pichli call me kya baat hui" knowledge the app already
+ * tracks — previously that data only reached the live greeting (and only when the
+ * student did not speak before the greeting fired), so text chat had ZERO idea the
+ * user had ever called.
+ *
+ * Returns '' when no call has ever completed, so callers can skip the block
+ * entirely. The snapshot tail is the last call's final exchanges (Student/Misa
+ * lines, capped) — the same continuation context the quick-redial greeting uses.
+ */
+export function buildLiveCallOverview(now = Date.now()): string {
+  const history = loadLiveCallHistory();
+  if (history.totalCalls === 0 && history.recent.length === 0) return '';
+  const bits = [`Total ${history.totalCalls} live call${history.totalCalls === 1 ? '' : 's'} hui hain`];
+  const last = history.recent[0];
+  if (last) {
+    const desc = describeLastCall(now);
+    bits.push(`last call ${desc?.text ?? 'kabhi'} (lasted ~${Math.max(1, last.durationSec)}s)`);
+  }
+  const tail = history.lastTranscriptSnapshot;
+  const lines: string[] = [];
+  if (tail.length > 0) {
+    lines.push('Pichli call me kya discuss hua tha (transcript tail):');
+    lines.push(...tail.slice(-8));
+  }
+  return bits.join('; ') + (lines.length > 0 ? `\n${lines.join('\n')}` : '');
+}
