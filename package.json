@@ -1,7 +1,7 @@
 {
   "name": "levelup",
   "private": true,
-  "version": "2026.09.7002",
+  "version": "2026.09.7004",
   "type": "module",
   "scripts": {
     "dev": "vite",
