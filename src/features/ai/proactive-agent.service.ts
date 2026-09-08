@@ -611,17 +611,10 @@ class ProactiveAgentService {
       // Purana behaviour: trigger ko pendingTriggers se pehle hi remove karke
       // validate kiya jaata tha; validation block (grace = user abhi app khol
       // kar aaya) → `if (validation.valid)` fail → message SILENTLY lost →
-      // "notification aaya, chat me message hai hi nahi". Sirf explicit DND
-      // shield ab bhi defer karta hai — bounded retry ke saath, kabhi silent
-      // drop nahi.
-      if (now < relState.boundaries.dndUntilTimestamp) {
-        const tries = (trig.deliveryRetries ?? 0) + 1;
-        if (tries < ProactiveAgentService.MAX_DELIVERY_RETRIES) {
-          this.pendingTriggers.push({ ...trig, scheduledTime: now + 5 * 60 * 1000, deliveryRetries: tries });
-          this.saveState();
-        }
-        continue;
-      }
+      // "notification aaya, chat me message hai hi nahi". Ab deliver hamesha
+      // hota hai. DND/quiet-time pehle hi line 587 par early-return karke
+      // trigger ko pending hi rakhta hai (kabhi remove nahi karta) → DND khatam
+      // hote hi agli poll par deliver; bounded retry ki koi zaroorat nahi.
 
       const validation = validateProactiveDelivery(
         {
@@ -674,7 +667,7 @@ class ProactiveAgentService {
           // Suppressed (quiet time / live call / interval / decline penalty):
           // re-schedule so a booked call isn't silently lost, with a retry cap.
           const tries = (item.deliveryRetries ?? 0) + 1;
-          if (tries < 3) {
+          if (tries < ProactiveAgentService.MAX_DELIVERY_RETRIES) {
             this.scheduledMessages.push({ ...item, scheduledTime: now + 5 * 60 * 1000, deliveryRetries: tries });
             this.saveState();
           } else {
@@ -714,7 +707,7 @@ class ProactiveAgentService {
           // forever — cap at 3 tries (~15 min) then drop with a warning so
           // the item can't zombie the sync scope with saveState() churn.
           const tries = (item.deliveryRetries ?? 0) + 1;
-          if (tries >= 3) {
+          if (tries >= ProactiveAgentService.MAX_DELIVERY_RETRIES) {
             console.warn(`[Proactive] Dropping scheduled message "${item.topic}" after ${tries} blocked retries.`);
             continue;
           }

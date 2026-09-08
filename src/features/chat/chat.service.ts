@@ -296,10 +296,14 @@ export class ChatService {
     return session;
   }
 
-  /** Append or live-update a message in an existing session and persist to storage. */
-  appendMessage(sessionId: string, message: ChatMessage): void {
+  /**
+   * Append or live-update a message in an existing session and persist to storage.
+   * Returns true when appended; false when the session no longer exists (caller
+   * should fall back — at-least-once handshake ke liye).
+   */
+  appendMessage(sessionId: string, message: ChatMessage): boolean {
     const session = this.getSession(sessionId);
-    if (!session) return;
+    if (!session) return false;
     const existingIdx = session.messages.findIndex((m) => m.id === message.id);
     if (existingIdx >= 0) {
       session.messages[existingIdx] = message;
@@ -310,6 +314,7 @@ export class ChatService {
     }
     session.updatedAt = this.clock.now().toISOString();
     this.persist();
+    return true;
   }
 
   /**

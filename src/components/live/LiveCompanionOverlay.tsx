@@ -952,7 +952,14 @@ export default function LiveCompanionOverlay({
     const currentTranscripts = clientRef.current?.getTranscripts() || transcripts;
     clientRef.current?.disconnect();
     void stopLiveCompanionService();
+    // AUDIT FIX: module pointer + live-call flag ko EK hi synchronous tick me
+    // clear karo. Purana flow `activeLiveClient = null` yahan karta tha aur
+    // `setLiveCallActive(false)` sirf unmount-cleanup me (React batch baad).
+    // Us gap me ChatScreen ka send() `isLiveCallActive()=true` par
+    // `getActiveLiveClient()=null` dekh ke message ko SILENTLY normal chat me
+    // bhej deta tha — live call me expected message galat jagah pahunchta.
     activeLiveClient = null;
+    setLiveCallActive(false);
     void resetNativeAudioRoute().catch(() => undefined);
     onClose(currentTranscripts);
   }

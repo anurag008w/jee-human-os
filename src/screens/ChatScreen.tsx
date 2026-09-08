@@ -1835,7 +1835,10 @@ export default function ChatScreen({
         isCallEvent: injected.isCallEvent,
         callStatus: injected.callStatus as any,
       };
-      container.chat.appendMessage(active.id, msg);
+      // AUDIT FIX: appendMessage ab boolean return karta hai — session vanish
+      // ho gaya (deleted) toh false → service store-fallback + window event
+      // chala ke SAME msgId se message commit kare; "true" par galati se nahi.
+      if (!container.chat.appendMessage(active.id, msg)) return false;
       refresh();
       haptic();
       return true;

@@ -41,7 +41,18 @@ jobs:
           else
             VERSION="${{ github.event.inputs.version }}"
             if [[ -z "$VERSION" ]]; then
-              VERSION="v$(date +%Y.%m.%d)"
+              # AUDIT FIX: kabhi plain-date tag (vYYYY.MM.DD) auto-default mat
+              # banao — build-number tag ke baad wo versionCode ko GHATA deta hai
+              # (2026097003 -> 2026090600) aur Android downgrade protection
+              # update install hone se rok deta hai. Default = latest BUILD-scheme
+              # tag ka next number (vYYYY.MM.XXXX).
+              LATEST_BUILD_TAG=$(git tag --list 'v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9][0-9][0-9]' | sort -V | tail -1 || true)
+              if [[ -z "$LATEST_BUILD_TAG" ]]; then
+                VERSION="v$(date +%Y.%m.)7000"
+              else
+                NEXT_BUILD=$(( "${LATEST_BUILD_TAG##*.}" + 1 ))
+                VERSION="v$(date +%Y.%m.)${NEXT_BUILD}"
+              fi
             fi
             if [[ ! "$VERSION" =~ ^v ]]; then
               VERSION="v$VERSION"
@@ -74,6 +85,17 @@ jobs:
           echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_OUTPUT
           echo "VERSION_CODE=$VERSION_CODE" >> $GITHUB_OUTPUT
           echo "📌 Release: $VERSION (versionCode $VERSION_CODE)"
+
+      - name: Verify package.json matches release tag
+        run: |
+          PKG_VERSION=$(node -e "console.log(require('./package.json').version)")
+          if [[ "${{ steps.version.outputs.VERSION_NAME }}" != "$PKG_VERSION" ]]; then
+            echo "❌ package.json version ($PKG_VERSION) does NOT match release tag (${{ steps.version.outputs.VERSION_NAME }})"
+            echo "   Ye tab hota hai jab tag version-bump commit se pehle wale commit par lagaya gaya ho."
+            echo "   Pehle release.sh se version bump karo ya tag ko bump commit par shift karo."
+            exit 1
+          fi
+          echo "✅ package.json version ($PKG_VERSION) matches release tag"
 
       - name: Determine previous tag
         id: prev_tag
