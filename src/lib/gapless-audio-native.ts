@@ -18,6 +18,7 @@ interface GaplessAudioTrackNative {
   open(options: { sampleRate?: number }): Promise<{ ok: boolean; sampleRate: number; channels: number; minBufferSize: number }>;
   write(options: { data: string }): Promise<void>;
   flush(): Promise<void>;
+  setVolume?(options: { volume: number }): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -115,6 +116,28 @@ export async function closeNativeAudioTrack(): Promise<void> {
     await Native.close();
   } catch (err) {
     console.warn('[GaplessAudioTrack] close failed:', err);
+  }
+}
+
+/**
+ * Apply an output level to the native track (0..1).
+ *
+ * The gapless sink BYPASSES the WebAudio graph, so `AudioStreamer`'s gain node —
+ * and therefore the user's volume setting and the AUDIOFOCUS_GAIN_CAN_DUCK
+ * ducking — were silent no-ops on Android while the call was audible through the
+ * AudioTrack. `AudioTrack.setVolume()` is the equivalent control there.
+ *
+ * Optional on the plugin: older builds (and the Capacitor test mocks) may not
+ * expose it, so this must never throw.
+ */
+export async function setNativeAudioTrackVolume(volume: number): Promise<void> {
+  if (!nativeOpened) return;
+  const v = Math.max(0, Math.min(1, volume));
+  try {
+    if (typeof Native.setVolume !== 'function') return;
+    await Native.setVolume({ volume: v });
+  } catch (err) {
+    console.warn('[GaplessAudioTrack] setVolume failed:', err);
   }
 }
 

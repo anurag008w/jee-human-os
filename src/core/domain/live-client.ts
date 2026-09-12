@@ -94,6 +94,20 @@ export class GeminiLiveClient {
    */
   private static readonly STALE_TURN_DROP_MS = 2000;
 
+  /**
+   * How long the near-end must be clearly dominant before it may cut Misa off,
+   * and the minimum spacing between two barge-in flushes.
+   *
+   * The old values were 200ms sustain with no minimum gap, and the flush was
+   * re-armed by its own `userInterruptStreakStartedAt = now`. With a mic gate
+   * that was tripping on the noise floor that produced a hard cut every ~200ms
+   * for the entire reply — literally the reported "awaz cut-cut ke aati hai".
+   * 320ms ≈ 2.4 audio chunks of *continuous* real speech; 450ms of spacing means
+   * one genuine interruption costs one cut, not five.
+   */
+  private static readonly BARGE_IN_SUSTAIN_MS = 320;
+  private static readonly BARGE_IN_MIN_GAP_MS = 450;
+
   private transcripts: LiveTranscriptItem[] = [];
   private pendingToolCalls: ChatToolCallRecord[] = [];
   private currentAssistantMessage = '';
@@ -2036,7 +2050,9 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     }
   }
 
-  private isUserTalkingOverThreshold = false;
+  /** Wall-clock of the last barge-in flush — rate-limits how often a reply may be
+   *  cut, so one sustained utterance costs ONE cut instead of one per chunk. */
+  private lastBargeInFlushAt = 0;
   private audioPreRollBuffer: string[] = [];
   private activeAssistantTurnId: string | null = null;
   private activeUserTurnId: string | null = null;
@@ -2479,23 +2495,15 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
         this.sendAudioChunk(pcm16Base64, rmsLevel);
       },
       (inputLevel) => {
-        const talking = inputLevel > 0.035;
-        this.isUserTalkingOverThreshold = talking;
-        // Register user speech activity
-        if (talking) {
-          if (!this.userInterruptStreakStartedAt) this.userInterruptStreakStartedAt = Date.now();
-          // Barge-in debounce: ek hi 80ms analyser spike (room echo, keyboard,
-          // door) Misa ki voice nahi kaat sakta. Sustained user speech
-          // (>=200ms) hone par hi playback flush hota hai — voice cutting fix.
-          if (this.status === 'speaking' && Date.now() - this.userInterruptStreakStartedAt >= 200) {
-            this.userInterruptStreakStartedAt = Date.now();
-            this.audioStreamer.flushPlayback();
-            this.setStatus('listening');
-          }
-        } else {
-          this.userInterruptStreakStartedAt = 0;
-        }
-        if (inputLevel > 0.025 && this.status === 'connected') {
+        // METER + status only. The barge-in decision used to live here too, on
+        // `inputLevel > 0.035`, and that is what chopped Misa's voice: the value
+        // arriving here was a dB-scaled FREQUENCY average (see
+        // AudioStreamer.startLevelMonitoring), so the "user is talking" flag was
+        // true basically whenever the mic was open — and the flush below then cut
+        // her playback every ~200ms for the whole reply. Barge-in now has ONE
+        // decision point, sendAudioChunk(), driven by the worklet's true
+        // time-domain RMS and an echo reference.
+        if (inputLevel > 0.02 && this.status === 'connected') {
           this.setStatus('listening');
         }
         this.updateStats(inputLevel, 0);
@@ -2604,26 +2612,56 @@ HOW TO SPEAK: Greet naturally like a close friend picking up. TONE EXAMPLES ONLY
     if (this.status !== 'listening' && this.status !== 'speaking') return;
 
     const now = Date.now();
-    // ── Post-playback echo cooldown (GoNoGo two-tier RMS gate) ──
-    // Right after Misa's voice stops, the speakers still resonate in the room
-    // (RMS decays 0.025→0.04 for ~1.5s). If we feed that decay to the model as
-    // "user speech" she hears her OWN words back as the user's — the classic
-    // "maine kuch bola, usko kuch aur sunai diya" garbling. During the
-    // cooldown we raise the speech threshold so only real (loud) speech passes;
-    // soft background decay is dropped instead of misheard.
-    const inPlaybackCooldown = now < this.playbackCooldownUntil;
-    const isSpeech = inPlaybackCooldown
-      ? rmsLevel > 0.055 || this.isUserTalkingOverThreshold
-      : rmsLevel > 0.032 || this.isUserTalkingOverThreshold;
+    // ── Barge-in / speech gate, referenced against our OWN playback ──
+    // `rmsLevel` is the worklet's true time-domain RMS of the mic (16kHz mono),
+    // computed off the audio render thread. While Misa is speaking, the mic also
+    // carries MISA: the reply plays out of a native AudioTrack, which Chromium's
+    // echoCancellation has no render reference for (and no platform
+    // AcousticEchoCanceler is installed on the capture session), so whether echo
+    // comes back is HAL luck. A fixed absolute threshold therefore cannot tell a
+    // student cutting in from her own voice returning — and every false positive
+    // flushed her playback, which is the "awaz cut-cut ke aati hai" report.
+    //
+    // So both gates are now relative to the far-end level we are playing
+    // (AudioStreamer.getRecentOutputRms, measured from the very PCM we hand to
+    // the sink). When she is not playing, farEndRms decays to 0 within ~250ms and
+    // both thresholds collapse back to their original absolute floors, so
+    // listening latency is untouched.
+    const farEndRms = this.audioStreamer.getRecentOutputRms();
+    // `vadSensitivity` was a Live-Settings slider that NOTHING read (only
+    // declared/defaulted in live-types.ts) — it is now the knob for how readily a
+    // barge-in is accepted, which is exactly what it always claimed to control.
+    const sensitivity = this.config.vadSensitivity ?? 'high';
+    const dominance = sensitivity === 'low' ? 3.2 : sensitivity === 'medium' ? 2.4 : 1.9;
+    const nearEndFloor = sensitivity === 'low' ? 0.09 : sensitivity === 'medium' ? 0.07 : 0.05;
 
-    // Barge-in debounce (shared with the analyser path): a single transient
-    // chunk (room echo, keyboard, cough) must not snip the assistant's voice.
-    // Only SUSTAINED user speech (>=200ms) flushes playback.
-    if (isSpeech && !this.userInterruptStreakStartedAt) this.userInterruptStreakStartedAt = now;
+    // Speech for the UPLOAD path: mild dominance, so a real (even quiet)
+    // interruption still reaches the model instead of being echo-suppressed away.
+    let isSpeech = rmsLevel > Math.max(0.032, farEndRms * 1.35);
+    // Post-playback echo cooldown: right after Misa's voice stops, the room still
+    // rings (decay 0.025→0.04 for ~1.5s). Feeding that to the model as "user
+    // speech" makes her hear her own words back as the student's. Raise the gate
+    // during the window — it must be a RAISED THRESHOLD: the previous code ORed a
+    // second (broken) flag in, which defeated this cooldown entirely.
+    if (now < this.playbackCooldownUntil) isSpeech = isSpeech && rmsLevel > 0.09;
+
+    // Interruption (the part that may CUT her): much stricter — sustained,
+    // clearly-dominant near-end speech, rate-limited so one utterance costs one
+    // cut instead of one cut per chunk.
+    const bargeInLevel = rmsLevel > Math.max(nearEndFloor, farEndRms * dominance);
+    if (bargeInLevel && !this.userInterruptStreakStartedAt) this.userInterruptStreakStartedAt = now;
+    if (!bargeInLevel) this.userInterruptStreakStartedAt = 0;
     const sustainedSpeech =
-      isSpeech && this.userInterruptStreakStartedAt > 0 && now - this.userInterruptStreakStartedAt >= 200;
+      bargeInLevel
+      && this.userInterruptStreakStartedAt > 0
+      && now - this.userInterruptStreakStartedAt >= GeminiLiveClient.BARGE_IN_SUSTAIN_MS;
 
-    if (this.status === 'speaking' && sustainedSpeech) {
+    if (
+      this.status === 'speaking'
+      && sustainedSpeech
+      && now - this.lastBargeInFlushAt >= GeminiLiveClient.BARGE_IN_MIN_GAP_MS
+    ) {
+      this.lastBargeInFlushAt = now;
       this.userInterruptStreakStartedAt = now;
       this.audioStreamer.flushPlayback();
       this.setStatus('listening');
