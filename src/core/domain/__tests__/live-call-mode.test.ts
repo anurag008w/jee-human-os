@@ -36,7 +36,7 @@ describe('Live Call Mode & Interruption Hardening', () => {
     proactiveAgentService.updatePreferences({ enabled: true });
   });
 
-  it('2. Audio streaming does not drop speech during assistant turns and barge-in flushes playback', async () => {
+  it('2. Echo cannot interrupt Misa — only sustained, dominant near-end speech cuts her', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1000);
     const client = new GeminiLiveClient(mockConfig);
@@ -48,29 +48,42 @@ describe('Live Call Mode & Interruption Hardening', () => {
     (client as any).session = mockSession;
 
     (client as any).status = 'speaking';
-    (client as any).isUserTalkingOverThreshold = false;
     const flushPlaybackSpy = vi.spyOn((client as any).audioStreamer, 'flushPlayback');
+    // Misa is playing out of the loudspeaker, so her own voice comes back into
+    // the mic at a fraction of the playback level. The far-end reference is what
+    // separates "student cut in" from "I heard myself" — the old gate had no
+    // reference at all, which is what chopped her voice every ~200ms.
+    vi.spyOn((client as any).audioStreamer, 'getRecentOutputRms').mockReturnValue(0.05);
 
-    // Single transient chunk (echo spike) — debounce window ke andar,
-    // Misa ki voice CUT nahi honi chahiye.
+    // Echo (0.08) while 0.05 is playing: below the dominance bar (0.05 × 2.4).
+    // Sustained across many frames → still must NOT cut.
     (client as any).sendAudioChunk('echo_spike', 0.08);
+    vi.setSystemTime(1600);
+    (client as any).sendAudioChunk('echo_spike_2', 0.08);
     expect(flushPlaybackSpy).not.toHaveBeenCalled();
     expect((client as any).status).toBe('speaking');
 
-    // Sustained user speech (>=200ms) — abhi barge-in flush hota hai
-    vi.setSystemTime(1200);
+    // A real interruption: clearly louder than playback AND sustained >=320ms.
+    (client as any).sendAudioChunk('user_start', 0.3);
+    vi.setSystemTime(1940);
     mockSession.sendRealtimeInput.mockClear();
-    (client as any).sendAudioChunk('base64_sample_pcm_chunk', 0.08);
-
-    expect(flushPlaybackSpy).toHaveBeenCalled();
+    (client as any).sendAudioChunk('user_continue', 0.3);
+    expect(flushPlaybackSpy).toHaveBeenCalledTimes(1);
     expect((client as any).status).toBe('listening');
     expect(mockSession.sendRealtimeInput).toHaveBeenCalledWith({
       audio: {
-        data: 'base64_sample_pcm_chunk',
+        data: 'user_continue',
         mimeType: 'audio/pcm;rate=16000',
       },
     });
 
+    // …and ONE utterance costs ONE cut: the same sustained speech 330ms later is
+    // inside the re-arm gap, so playback is not flushed chunk after chunk.
+    mockSession.sendRealtimeInput.mockClear();
+    (client as any).status = 'speaking';
+    vi.setSystemTime(2270);
+    (client as any).sendAudioChunk('user_more', 0.3);
+    expect(flushPlaybackSpy).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
   });
 
@@ -85,7 +98,6 @@ describe('Live Call Mode & Interruption Hardening', () => {
     };
     (client as any).session = mockSession;
     (client as any).status = 'speaking';
-    (client as any).isUserTalkingOverThreshold = false;
 
     // Silence — echo suppression drop karta hai (koi speech nahi, 220ms guard)
     (client as any).sendAudioChunk('silence_chunk_1', 0.01);
@@ -94,13 +106,13 @@ describe('Live Call Mode & Interruption Hardening', () => {
     expect(mockSession.sendRealtimeInput).not.toHaveBeenCalled();
 
     // User speech shuru — streak start (abhi 0ms elapsed)
-    (client as any).sendAudioChunk('user_speech_start', 0.06);
+    (client as any).sendAudioChunk('user_speech_start', 0.2);
 
-    // 200ms+ ke baad sustained speech — pre-roll buffer flush hokar
+    // 320ms+ ke baad sustained speech — pre-roll buffer flush hokar
     // initial phonemes model ko bheje jate hain
-    vi.setSystemTime(1200);
+    vi.setSystemTime(1400);
     mockSession.sendRealtimeInput.mockClear();
-    (client as any).sendAudioChunk('user_speech_continue', 0.06);
+    (client as any).sendAudioChunk('user_speech_continue', 0.2);
 
     expect(mockSession.sendRealtimeInput).toHaveBeenCalledWith({
       audio: {

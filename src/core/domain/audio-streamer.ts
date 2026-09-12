@@ -1,7 +1,10 @@
 import { Capacitor } from '@capacitor/core';
 import {
+  closeNativeAudioTrack,
   ensureNativeAudioTrack,
   flushNativeAudioTrack,
+  nativeGaplessActive,
+  setNativeAudioTrackVolume,
   writeNativeAudioChunk,
 } from '../../lib/gapless-audio-native';
 import { WORKLET_PROCESSOR_NAME, WORKLET_SOURCE } from './audio-worklet-processor';
@@ -73,6 +76,23 @@ export class AudioStreamer {
   // chunk on a slow link still cuts the opening words. Hold the first write
   // until a small burst is buffered (or a hard cap passes — never stall longer
   // than this on a reply that genuinely wants to start).
+  //
+  // 2026-09 FIX: that hold existed only as a comment — the native branch of
+  // playAudioChunk wrote every chunk straight to the AudioTrack, so on Android
+  // the whole anti-stutter machinery above (PRE_ROLL / STARTUP_BUFFER_COUNT /
+  // under-run recovery) was bypassed and the ONLY cushion was the ~250ms
+  // AudioTrack buffer. Any network gap longer than that = underrun = a hole in
+  // the voice ("cut cut"). These constants give the native sink the same
+  // receiver-side jitter buffer the WebAudio path always had.
+  private static readonly NATIVE_PREROLL_MS = 260;
+  /** Hard cap on the cold-start hold: never delay the first sound longer than this. */
+  private static readonly NATIVE_PREROLL_MAX_WAIT_MS = 340;
+  /** Back-pressure ceiling for the JS-side hold queue (drop-oldest beyond this). */
+  private static readonly NATIVE_QUEUE_LIMIT_MS = 1500;
+  /** Consecutive native write failures tolerated before falling back to WebAudio. */
+  private static readonly NATIVE_WRITE_FAILURES_MAX = 2;
+  /** Rolling window over which Misa's OWN playback is remembered as echo reference. */
+  private static readonly FAR_END_WINDOW_MS = 160;
 
   private audioContext: AudioContext | null = null;
   private micStream: MediaStream | null = null;
@@ -115,6 +135,26 @@ export class AudioStreamer {
   // native plugin opened successfully and is the current playback sink). A null
   // means "not yet decided" — we try native on the first chunk, then commit.
   private nativeReady: boolean | null = null;
+  // ── Native sink pre-roll + far-end reference (2026-09 voice-chopping fix) ──
+  // Chunks waiting to be handed to the AudioTrack, so the native path starts a
+  // reply with a cushion instead of one lonely chunk, and re-primes after an
+  // under-run/flush the same way drainPendingChunks() does for WebAudio.
+  private nativeQueue: Array<{ b64: string; ms: number }> = [];
+  private nativeQueuedMs = 0;
+  /** When the oldest held (not yet written) chunk arrived — bounds the hold. */
+  private nativePrerollAt = 0;
+  /** True once the first burst of a reply has been handed to the AudioTrack. */
+  private nativePrimed = false;
+  /** Timer that releases a held burst when no further chunk arrives. */
+  private nativePumpTimer: ReturnType<typeof setTimeout> | null = null;
+  private nativeWriteFailures = 0;
+  // Far-end (what WE are playing) RMS + timestamp. The mic gate in the live
+  // client compares the near-end against this, so Misa's own voice coming back
+  // through the mic can no longer interrupt — or even be uploaded as — her
+  // reply. Chromium's AEC has no reference for the native AudioTrack, so this
+  // is the only echo reference the app has.
+  private farEndRms = 0;
+  private farEndAt = 0;
   // Receive-side jitter buffer: incoming decoded chunks wait here until the
   // scheduler feeds them to the DAC gaplessly. Absorbs weak-network gaps.
   private pendingChunks: AudioBuffer[] = [];
@@ -138,6 +178,72 @@ export class AudioStreamer {
         this.outputGainNode.gain.setValueAtTime(this.outputVolume, this.audioContext.currentTime);
       } catch {}
     }
+    // The native gapless sink BYPASSES the WebAudio graph entirely, so a gain
+    // node alone does nothing there — the audio-focus ducking (AUDIOFOCUS_CAN_DUCK)
+    // and the user's volume setting were silently no-ops on Android. Apply the
+    // same value to the AudioTrack too.
+    if (this.nativeReady) void setNativeAudioTrackVolume(this.outputVolume);
+  }
+
+  /**
+   * How loud WE are right now (0..1 RMS of the TTS PCM we are playing), faded
+   * out over ~200ms after playback stops. The live client uses this as the
+   * echo reference for its barge-in decision — see `sendAudioChunk`.
+   * Returns 0 when nothing has played in the last 250ms (nothing to cancel).
+   */
+  getRecentOutputRms(): number {
+    const since = Date.now() - this.farEndAt;
+    if (since > 250) return 0;
+    // Hold the level briefly (chunks arrive every ~130ms, so a single gap is
+    // not "she stopped talking"), then ramp to zero across 200ms.
+    if (since <= AudioStreamer.FAR_END_WINDOW_MS) return this.farEndRms;
+    const decay = 1 - (since - AudioStreamer.FAR_END_WINDOW_MS) / 200;
+    return decay > 0 ? this.farEndRms * decay : 0;
+  }
+
+  /** True when the AudioTrack — not WebAudio — is the active output sink. */
+  isNativeSinkActive(): boolean {
+    return this.nativeReady === true || nativeGaplessActive();
+  }
+
+  /**
+   * One pass over a base64 24kHz/16-bit mono chunk: duration + RMS.
+   *
+   * Previously the native branch decoded the chunk with a bare `atob()` ONLY to
+   * estimate its duration — unguarded, so a corrupt server chunk threw out of
+   * playAudioChunk into the WebSocket message handler, and the decoded samples
+   * were thrown away. Measuring here costs the same single pass and yields the
+   * far-end reference the mic gate needs.
+   */
+  private measurePcm(pcm24kBase64: string): { binary: string; numSamples: number; rms: number } | null {
+    let binary: string;
+    try {
+      binary = atob(pcm24kBase64);
+    } catch {
+      // Malformed server chunk — drop it instead of crashing playback.
+      console.warn('[AudioStreamer] Dropping malformed audio chunk (bad base64).');
+      return null;
+    }
+    const numSamples = Math.floor(binary.length / 2);
+    if (numSamples <= 0) return null;
+    let sumSq = 0;
+    for (let i = 0; i < numSamples; i++) {
+      const lo = binary.charCodeAt(i * 2) ?? 0;
+      const hi = binary.charCodeAt(i * 2 + 1) ?? 0;
+      let sample = lo | (hi << 8);
+      if (sample >= 32768) sample -= 65536;
+      const norm = sample / 32768;
+      sumSq += norm * norm;
+    }
+    return { binary, numSamples, rms: Math.sqrt(sumSq / numSamples) };
+  }
+
+  /** Record what we are playing so the near-end gate can subtract it. */
+  private noteFarEnd(rms: number, chunkMs: number): void {
+    // Duration-weighted moving average over ~1 FAR_END_WINDOW of audio.
+    const alpha = chunkMs > 0 ? chunkMs / (chunkMs + AudioStreamer.FAR_END_WINDOW_MS) : 0.5;
+    this.farEndRms = this.farEndRms * (1 - alpha) + rms * alpha;
+    this.farEndAt = Date.now();
   }
 
   setOnPlaybackEnded(cb?: () => void): void {
@@ -417,12 +523,27 @@ export class AudioStreamer {
 
   /** Direct hardware DAC scheduling with clean linear PCM streaming. */
   playAudioChunk(pcm24kBase64: string): void {
+    // ONE decode pass per chunk: duration + RMS (the RMS is the echo/far-end
+    // reference the barge-in gate needs) + the raw bytes the WebAudio path decodes
+    // below. This replaces a second, unguarded atob() in the native branch that
+    // decoded the chunk purely to estimate its duration — and threw on a corrupt
+    // server chunk straight out into the WebSocket message handler.
+    const measured = this.measurePcm(pcm24kBase64);
+    if (!measured) return;
+    const { binary, numSamples } = measured;
+    const speed = this.playbackSpeed && this.playbackSpeed > 0 ? this.playbackSpeed : 1.0;
+    const chunkMs = (numSamples / 24000) * 1000 * (1 / speed);
+    this.noteFarEnd(measured.rms, chunkMs);
+
     // ── Native gapless path (Android) ──
     // On native, route the PCM to our GaplessAudioTrack plugin. AudioTrack
     // MODE_STREAM glues consecutive writes together so there are NO per-chunk
     // boundaries — the real "bubble-end / bade messages" stutter fix, which
     // WebAudio AudioBufferSourceNode chaining can not guarantee. Once native is
-    // confirmed we deliberately bypass the WebAudio scheduler + jitter-buffer.
+    // confirmed we deliberately bypass the WebAudio scheduler, so the native sink
+    // gets its OWN pre-roll (enqueueNative) — without it the WebAudio anti-stutter
+    // machinery was inert on Android and the only cushion was the ~250ms
+    // AudioTrack buffer, i.e. every network gap cut the voice.
     if (Capacitor.isNativePlatform()) {
       if (this.nativeReady === null) {
         // First chunk on native: kick off the plugin open. Until it resolves we
@@ -444,37 +565,13 @@ export class AudioStreamer {
           })
           .catch(() => { this.nativeReady = false; });
       } else if (this.nativeReady) {
-        // Native is live: enqueue fire-and-forget. If a write happens to fail,
-        // the module already logged it; we keep the native path (best-effort).
-        // No end-event from the AudioTrack → extend a rolling deadline so the
-        // drain wait finishes ~one chunk after the last write, never a whole
-        // reply duration later.
-        const spent = atob(pcm24kBase64);
-        const numSamples = Math.floor(spent.length / 2);
-        if (numSamples > 0) {
-          const speed = this.playbackSpeed && this.playbackSpeed > 0 ? this.playbackSpeed : 1.0;
-          const nativeDurMs = (numSamples / 24000) * 1000 * (1 / speed);
-          const deadline = Date.now() + nativeDurMs;
-          this.nativePlaybackDeadline = Math.max(this.nativePlaybackDeadline, deadline);
-        }
-        void writeNativeAudioChunk(pcm24kBase64);
+        this.enqueueNative(pcm24kBase64, chunkMs);
         return;
       }
     }
 
     const ctx = this.audioContext || this.getContext();
     if (!ctx || ctx.state === 'closed') return;
-
-    let binary: string;
-    try {
-      binary = atob(pcm24kBase64);
-    } catch {
-      // Malformed server chunk — drop it instead of crashing playback.
-      console.warn('[AudioStreamer] Dropping malformed audio chunk (bad base64).');
-      return;
-    }
-    const numSamples = Math.floor(binary.length / 2);
-    if (numSamples <= 0) return;
 
     // Decode straight into the AudioBuffer channel — one allocation + one loop,
     // no intermediate Float32Array + set() copy. Runs on the main thread but is
@@ -504,6 +601,105 @@ export class AudioStreamer {
     // stutter culprit — that is what the queue + PRE_ROLL chain below fixes.
     this.pendingChunks.push(audioBuffer);
     this.kickScheduler();
+  }
+
+  /**
+   * Receiver-side hold for the native AudioTrack sink (Android).
+   *
+   * Cold start and every post-flush resume wait until ~NATIVE_PREROLL_MS of
+   * audio is buffered, so a reply never starts into an empty 250ms track (that
+   * is what clipped the first words of every answer), and a bursty link stops
+   * turning into one underrun per gap. Once primed, chunks stream straight
+   * through — the track's own buffer is the cushion — so steady-state latency is
+   * unchanged.
+   */
+  private enqueueNative(pcm24kBase64: string, chunkMs: number): void {
+    this.nativeQueue.push({ b64: pcm24kBase64, ms: chunkMs });
+    this.nativeQueuedMs += chunkMs;
+    if (this.nativePrerollAt === 0) this.nativePrerollAt = Date.now();
+
+    // Back-pressure: the AudioTrack queue is the real buffer, so never pile more
+    // than the ceiling up here (the old fire-and-forget path grew the NATIVE side
+    // without limit during a stall). Drop the OLDEST held audio — it is already
+    // stale — and keep the newest.
+    while (this.nativeQueuedMs > AudioStreamer.NATIVE_QUEUE_LIMIT_MS && this.nativeQueue.length > 1) {
+      const dropped = this.nativeQueue.shift();
+      if (dropped) this.nativeQueuedMs = Math.max(0, this.nativeQueuedMs - dropped.ms);
+    }
+
+    if (!this.nativePrimed) {
+      const waitedMs = Date.now() - this.nativePrerollAt;
+      const ready = this.nativeQueuedMs >= AudioStreamer.NATIVE_PREROLL_MS
+        || waitedMs >= AudioStreamer.NATIVE_PREROLL_MAX_WAIT_MS;
+      if (!ready) {
+        // Nothing else may ever arrive (a one-chunk reply) → release the hold on
+        // a timer, never permanently.
+        this.scheduleNativePump(AudioStreamer.NATIVE_PREROLL_MAX_WAIT_MS - waitedMs);
+        return;
+      }
+      this.nativePrimed = true;
+    }
+    this.pumpNative();
+  }
+
+  /** Write everything held so far, in order, keeping the rolling drain deadline. */
+  private pumpNative(): void {
+    if (this.nativePumpTimer !== null) {
+      clearTimeout(this.nativePumpTimer);
+      this.nativePumpTimer = null;
+    }
+    while (this.nativeQueue.length > 0) {
+      const chunk = this.nativeQueue.shift();
+      if (!chunk) break;
+      this.nativeQueuedMs = Math.max(0, this.nativeQueuedMs - chunk.ms);
+      // No end-event from the AudioTrack → extend a rolling wall-clock deadline so
+      // the drain wait finishes ~one chunk after the last write, never a whole
+      // reply duration later.
+      this.nativePlaybackDeadline = Math.max(this.nativePlaybackDeadline, Date.now() + chunk.ms);
+      void writeNativeAudioChunk(chunk.b64).then((ok) => {
+        if (ok) this.nativeWriteFailures = 0;
+        else this.onNativeWriteFailure();
+      });
+    }
+  }
+
+  private scheduleNativePump(delayMs: number): void {
+    if (this.nativePumpTimer !== null) return;
+    this.nativePumpTimer = setTimeout(() => {
+      this.nativePumpTimer = null;
+      if (this.nativeQueue.length === 0) return;
+      this.nativePrimed = true; // whatever we have is all we are going to get
+      this.pumpNative();
+    }, Math.max(8, delayMs));
+  }
+
+  /**
+   * gapless-audio-native's own comment promised "we drop back to WebAudio" when a
+   * native write failed — that fallback never existed: playAudioChunk fired and
+   * forgot, so a dead sink (plugin destroyed on an Activity recreation during a
+   * PiP call, track released, …) silently swallowed the REST of every reply.
+   * Two consecutive failures now hand playback back to WebAudio for the call and
+   * re-drive whatever was still held.
+   */
+  private onNativeWriteFailure(): void {
+    this.nativeWriteFailures += 1;
+    if (this.nativeWriteFailures < AudioStreamer.NATIVE_WRITE_FAILURES_MAX) return;
+    if (this.nativeReady === false) return; // already fell back
+    console.warn('[AudioStreamer] Native gapless writes failing — falling back to WebAudio for this call.');
+    this.nativeReady = false;
+    this.nativePrimed = false;
+    this.nativeWriteFailures = 0;
+    const held = this.nativeQueue.splice(0, this.nativeQueue.length);
+    this.nativeQueuedMs = 0;
+    this.nativePrerollAt = 0;
+    if (this.nativePumpTimer !== null) {
+      clearTimeout(this.nativePumpTimer);
+      this.nativePumpTimer = null;
+    }
+    // Release the (possibly half-dead) native track so the NEXT call opens a fresh
+    // one with an empty queue instead of inheriting stale PCM.
+    void closeNativeAudioTrack();
+    for (const chunk of held) this.playAudioChunk(chunk.b64);
   }
 
   // Schedule queued chunks onto the hardware clock. Runs the actual
@@ -666,9 +862,25 @@ export class AudioStreamer {
   flushPlayback(notifyEnded = true): void {
     // Native gapless path: drop any PCM still queued on the AudioTrack and
     // reset the sink so a new reply starts from a clean gapless stream.
-    if (this.nativeReady) {
+    //
+    // Deliberately keyed on the GLOBAL sink state, not this instance's
+    // `nativeReady`: the AudioTrack is a process-wide singleton that is reused
+    // across reconnects and calls, while `nativeReady` is per-client. Gating on
+    // the per-instance flag meant a fresh client (reconnect, next call) skipped
+    // the native flush and left the PREVIOUS turn's PCM in the sink — which then
+    // played at the start of the next reply as garbled/cut audio.
+    if (this.nativeReady || nativeGaplessActive()) {
       void flushNativeAudioTrack();
     }
+    // Release the pre-roll hold too: those chunks belong to the reply being cut.
+    if (this.nativePumpTimer !== null) {
+      clearTimeout(this.nativePumpTimer);
+      this.nativePumpTimer = null;
+    }
+    this.nativeQueue = [];
+    this.nativeQueuedMs = 0;
+    this.nativePrerollAt = 0;
+    this.nativePrimed = false;
     if (this.scheduleTimer !== null) {
       clearTimeout(this.scheduleTimer);
       this.scheduleTimer = null;
@@ -700,28 +912,70 @@ export class AudioStreamer {
    */
   getPendingPlaybackMs(): number {
     const native = this.nativePlaybackDeadline > 0 ? this.nativePlaybackDeadline - Date.now() : 0;
-    return Math.max(0, this.pendingPlaybackMs) + Math.max(0, native);
+    // Audio still inside our OWN pre-roll hold has not reached the sink yet, so
+    // the deadline cannot account for it — without this term a hang-up after a
+    // held cold start would stop playback mid-word (the very thing P10 guards).
+    return Math.max(0, this.pendingPlaybackMs) + Math.max(0, native) + Math.max(0, this.nativeQueuedMs);
   }
 
+  /**
+   * Level meter for the reactive UI (orb/wave) and the live client's
+   * "did anybody make a sound at all" hint.
+   *
+   * ROOT CAUSE of the live-call voice chopping, fixed here. This used to read
+   * getByteFrequencyData() — per the Web Audio spec each byte of that array is a
+   * DECIBEL value mapped from [minDecibels=-100, maxDecibels=-30] onto 0…255, not
+   * an amplitude — and then averaged it over 128 bins and divided by 255, while
+   * the consumer compared the result with a 0.035 threshold that is only sane for
+   * a time-domain RMS. On that dB scale a bin at a merely quiet −84 dBFS already
+   * reads 58, so ~20 bins of ordinary room noise floor clears 0.035: the
+   * "user is talking" flag was effectively always on, and the live client's
+   * barge-in debounce therefore flushed Misa's own playback every ~200ms — the
+   * "awaz cut-cut ke aati hai" symptom, on every device, on every call.
+   *
+   * getByteTimeDomainData() is the actual waveform (128 = centre silence), so the
+   * computed value is a true 0..1 RMS and the existing thresholds mean what their
+   * names say.
+   */
   private startLevelMonitoring(): void {
     if (this.levelInterval !== null) return;
-    const inputData = new Uint8Array(128);
-    const outputData = new Uint8Array(128);
+    // Both analysers are created with fftSize = 256 (see getContext /
+    // startRecording), and time-domain data is one sample per fftSize — so a
+    // fixed 256-byte scratch covers the whole window exactly. (The old code
+    // allocated 128, i.e. frequencyBinCount, which is the wrong size for a
+    // time-domain read even if the call had been the right one.)
+    const inputTime = new Uint8Array(new ArrayBuffer(256));
+    const outputTime = new Uint8Array(new ArrayBuffer(256));
+
+    const rmsOf = (timeData: Uint8Array): number => {
+      let sumSq = 0;
+      for (let i = 0; i < timeData.length; i++) {
+        const v = (timeData[i] - 128) / 128;
+        sumSq += v * v;
+      }
+      return Math.sqrt(sumSq / Math.max(1, timeData.length));
+    };
 
     this.levelInterval = window.setInterval(() => {
       if (this.inputAnalyser && this.onInputLevel) {
-        this.inputAnalyser.getByteFrequencyData(inputData);
-        let sum = 0;
-        for (let i = 0; i < inputData.length; i++) sum += inputData[i];
-        const avg = sum / inputData.length / 255;
-        this.onInputLevel(this.isMuted ? 0 : avg);
+        if (typeof this.inputAnalyser.getByteTimeDomainData === 'function') {
+          this.inputAnalyser.getByteTimeDomainData(inputTime);
+          // Muted must read exactly 0 — the live client gates upload + barge-in
+          // on this, so any residual meter movement would keep interrupting her.
+          this.onInputLevel(this.isMuted ? 0 : rmsOf(inputTime));
+        }
       }
-      if (this.outputAnalyser && this.onOutputLevel) {
-        this.outputAnalyser.getByteFrequencyData(outputData);
-        let sum = 0;
-        for (let i = 0; i < outputData.length; i++) sum += outputData[i];
-        const avg = sum / outputData.length / 255;
-        this.onOutputLevel(avg);
+      if (this.onOutputLevel) {
+        // On the native gapless sink nothing flows through the WebAudio graph, so
+        // the output analyser is permanently silent — the orb died and any
+        // output-referenced logic was blind. Report the far-end level we measured
+        // from the PCM we are actually playing instead.
+        if (this.nativeReady || nativeGaplessActive()) {
+          this.onOutputLevel(this.getRecentOutputRms());
+        } else if (this.outputAnalyser && typeof this.outputAnalyser.getByteTimeDomainData === 'function') {
+          this.outputAnalyser.getByteTimeDomainData(outputTime);
+          this.onOutputLevel(rmsOf(outputTime));
+        }
       }
     }, 80);
   }
@@ -787,6 +1041,25 @@ export class AudioStreamer {
     this.htmlAudioUnlocked = false;
     // Never re-validate `tryInitWorklet` against a dead context on a NEW one.
     this.workletModuleLoadedCtx = null;
+    // Release the native sink with the call. Nothing used to do this —
+    // closeNativeAudioTrack() had zero callers — so the AudioTrack, its writer
+    // thread and any PCM left in its queue lived for the whole process: the next
+    // call inherited a stale, mode-flipped track (and, if the plugin had been
+    // destroyed by an Activity recreation, a sink that rejected every write).
+    // Closing here means the next call re-opens a fresh track with an empty queue.
+    this.nativeQueue = [];
+    this.nativeQueuedMs = 0;
+    this.nativePrerollAt = 0;
+    this.nativePrimed = false;
+    this.nativeWriteFailures = 0;
+    this.nativeReady = null;
+    this.farEndRms = 0;
+    this.farEndAt = 0;
+    if (this.nativePumpTimer !== null) {
+      clearTimeout(this.nativePumpTimer);
+      this.nativePumpTimer = null;
+    }
+    void closeNativeAudioTrack();
   }
 
   // ===== Helper conversions =====

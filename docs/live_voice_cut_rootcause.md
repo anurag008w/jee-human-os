@@ -1,5 +1,10 @@
 # Live call: "awaz cut-cut ke aati hai" — root-cause analysis (2026-09-12)
 
+> **STATUS: FIXED (2026-09-12).** Causes #1–#4 are patched; the analysis below is kept as the
+> write-up, with a **[FIXED]** marker on each. What is deliberately NOT changed here is listed at the
+> end ("still open by choice"). Suite is green: 110 files / 1376 tests, `tsc` clean, `oxlint` 0 errors.
+> Needs a real-device pass (speakerphone / BT / quiet room / long reply) before shipping.
+
 Symptom: Misa ki live-call voice beech mein bar-bar kat'ti hai (stutter/chop), mostly har reply pe,
 Android app me. Niche 4 independent causes, ranked by how much of the symptom each explains, with
 file:line proof. Nothing here is device-luck: cause #1 fires on every call.
@@ -20,7 +25,7 @@ model audio parts (24kHz PCM base64)                          live-client.ts:156
 
 ---
 
-## Cause #1 (PRIMARY, deterministic): barge-in VAD is fed a garbage level metric → playback is flushed every ~200ms while Misa speaks
+## Cause #1 (PRIMARY, deterministic) **[FIXED]**: barge-in VAD was fed a garbage level metric → playback was flushed every ~200ms while Misa speaks
 
 The "voice cutting fix" is the 200ms barge-in debounce:
 
@@ -143,7 +148,7 @@ Also: stop ORing `isUserTalkingOverThreshold` into `isSpeech` (`:2616-2617`) —
 
 ---
 
-## Cause #2: the native playback path has **no jitter buffer at all** — the anti-stutter machinery exists but Android bypasses it
+## Cause #2 **[FIXED]**: the native playback path had **no jitter buffer at all** — the anti-stutter machinery exists but Android bypasses it
 
 `playAudioChunk` routes to the native track and returns *before* the WebAudio scheduler:
 
@@ -197,7 +202,7 @@ for a voice call over mobile data if barge-in latency is handled by the flush in
 
 ---
 
-## Cause #3: every cut is harsher than it needs to be — flush is a hard digital cut, and short writes throw away the rest of the chunk
+## Cause #3 **[FIXED]**: every cut is harsher than it needs to be — flush is a hard digital cut, and short writes throw away the rest of the chunk
 
 * `flushNativeAudioTrack()` → `t.pause(); t.flush(); t.play()` (`GaplessAudioTrackPlugin.java:157-171`).
   `AudioTrack.flush()` discards everything already written but not yet rendered (up to the full 250 ms
@@ -232,7 +237,7 @@ while (written < chunk.length && !closed.get() && guard++ < 8) {
 
 ---
 
-## Cause #4: the native sink is a process-wide singleton that is never closed, never re-opened, and never falls back
+## Cause #4 **[FIXED]**: the native sink is a process-wide singleton that is never closed, never re-opened, and never falls back
 
 * `closeNativeAudioTrack()` (`src/lib/gapless-audio-native.ts:111-119`) **has zero callers.** The Java track
   is therefore opened once (first chunk of the first call) and reused for the life of the process; the
@@ -311,6 +316,34 @@ Cheap robust mitigations, in order of effort:
    the metric is inflated — Cause #1, no build needed.
 4. Log `this.audioStreamer.getCaptureEngine()`: `scriptprocessor` on a low-end device adds main-thread
    pressure per chunk and worsens #2's underruns (that is the documented hang path).
+
+## What was changed (same day, 2026-09-12)
+
+| File | Change |
+|---|---|
+| `src/core/domain/audio-streamer.ts` | Level meter switched from `getByteFrequencyData` (dB-scaled bins averaged over 128) to a true **time-domain RMS** via `getByteTimeDomainData`, sized from `fftSize`; muted mic reads exactly 0. The native sink got its **own pre-roll** (`NATIVE_PREROLL_MS = 260`, hard-capped by `NATIVE_PREROLL_MAX_WAIT_MS = 340`, drop-oldest past `NATIVE_QUEUE_LIMIT_MS = 1500`) — the same jitter-buffer contract the WebAudio path always had, plus re-arming after every flush. `flushPlayback()` now flushes the native track whenever the **global** sink is live (not only when this instance's `nativeReady` resolved), which is what let a previous turn's PCM leak into the next reply. One `atob` per chunk now yields duration **and** far-end RMS (`measurePcm`), replacing an unguarded decode that could throw into the WS message handler. `getRecentOutputRms()` exposes the echo reference; on native the output level is reported from the far-end (the WebAudio analyser is silent there — that is why the orb died); `setOutputVolume()` also drives the native track; `NATIVE_WRITE_FAILURES_MAX = 2` consecutive failures hand playback back to **WebAudio** and release the dead sink; `close()` calls `closeNativeAudioTrack()` at last. |
+| `src/core/domain/live-client.ts` | Deleted the duplicate analyser-driven barge-in flush — `sendAudioChunk` is now the single decision point. Its gate is relative to our own playback (`rmsLevel > max(floor, farEndRms × dominance)`), sustain 200→**320ms**, and flushes are rate-limited to one per **450ms** so one utterance costs one cut. The post-playback cooldown is a genuine raised threshold now (the `\|\| isUserTalkingOverThreshold` that silently defeated it is gone). `vadSensitivity` — a Live-Settings slider that **nothing used to read** — now sets the dominance bar (low 3.2 / medium 2.4 / high 1.9), so the control actually exists. |
+| `android/.../GaplessAudioTrackPlugin.java` | Track buffer ~250ms → **~500ms** of jitter cushion; `pending` **bounded** (48 chunks) with drop-oldest; `sinkLock` guards the track/thread hand-off and `closeTrackInternal()` **joins the writer before `release()`** (kills the release-vs-write race); short or zero writes **retry** (re-arming `play()`) instead of discarding the rest of the chunk; 8ms **fade-in** after open/flush removes the resume click; new `setVolume` for native ducking. |
+| `src/lib/gapless-audio-native.ts` | Added `setNativeAudioTrackVolume()` (method-optional safe), and the file's existing promise — "if native hiccups we drop back to WebAudio" — is now actually implemented by the caller. |
+| tests | New `live-native-audio.test.ts` (12 tests): pre-roll hold + in-order flush, timer release of a lone chunk, no delay once primed, held chunks dropped on flush, WebAudio fallback + sink release, pending-playback accounting for the hold, native volume, first-chunk-during-open, `close()` teardown; and the meter tests asserting silence reads 0, the value is a true RMS, mute reads exactly 0, and `getByteFrequencyData` is never called. `live-call-mode.test.ts` 2/3 rewritten for the new contract (echo 0.08 while 0.05 is playing must NOT cut; sustained dominant speech cuts exactly once, not per chunk). |
+
+`npx tsc --noEmit -p tsconfig.app.json` clean · `oxlint src` 0 errors (same 6 pre-existing warnings) ·
+`vitest run` 110 files / **1376** tests green.
+
+### Still open by choice (needs a product call, not a patch)
+
+- **A real AEC.** The gate now *tolerates* echo; it does not cancel it. Cancelling properly means the
+  output has to be a reference the canceler can see: either WebAudio as the sole Android output
+  (losing the gapless sink), or native `AudioRecord` capture + `AcousticEchoCanceler` on a shared audio
+  session replacing `getUserMedia`. Both are bigger than this fix; near-end dominance is the pragmatic
+  90% and is measurable in the field.
+- **"Tap to interrupt" mode.** `vadSensitivity: 'low'` is already conservative; a hard half-duplex mode
+  (no automatic flush at all) is a UI decision worth considering if any device still misbehaves.
+- `closeNativeAudioTrack()` is called on explicit hangup only. A reconnect deliberately keeps the track
+  open — re-opening mid-call would drop ~300ms of already-written audio, worse than what it fixes.
+- `MainActivity.onDestroy` clearing the statics without an `if (instance == this)` guard is untouched
+  here (finding 1.12 of `docs/DEEP_SCAN_2026-09-12.md`) — it is the same live-call surface, so fix it
+  before blaming residual field reports on this change.
 
 ## Test plan for the fix
 
